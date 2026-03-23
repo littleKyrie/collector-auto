@@ -1,0 +1,36 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  Tech stack: Python 3.x, pymodbus>=3.0.0, Modbus-TCP
+  Domain: 文物扫描设备控制系统，通过 Modbus-TCP 与 PLC 通讯
+  
+  ## pymodbus 3.0.0+ API 重要变化
+  - **关键变化**: `unit` 参数已更名为 `device_id`
+  - 正确用法: `client.read_coils(address, count=1, device_id=unit)`
+  - 错误用法: `client.read_coils(address, count=1, unit=unit)` (2.x 版本)
+  
+  ## 受影响的方法
+  所有 Modbus 操作方法都需要使用 `device_id` 而非 `unit`:
+  - read_coils(address, count, device_id)
+  - read_holding_registers(address, count, device_id)
+  - write_coil(address, value, device_id)
+  - write_register(address, value, device_id)
+  - write_registers(address, values, device_id)
+  
+  ## 代码规范
+  - 使用 logging 模块记录日志
+  - 异常处理使用 ModbusException
+  - 连接管理需要实现 connect/disconnect 方法
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours

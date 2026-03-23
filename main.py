@@ -30,23 +30,31 @@ def progress_callback(current, total):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description='360度旋转控制脚本 - 控制PLC执行自动化旋转',
+        description='360度旋转控制脚本 - 控制PLC执行自动化旋转（模式1：间隔运行+触发）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   python main.py                          # 使用默认参数(12次, 10°/s, 3秒延时)
   python main.py --rotations 24           # 24次旋转，每次15°
-  python main.py --speed 5 --delay 5      # 速度5°/s，延时5秒
+  python main.py --speed 5 --delay 5      # 速度5°/s，拍照后等待5秒
   python main.py --host 192.168.1.100     # 连接其他PLC地址
+  python main.py --error-continue-model 0 # 异常后继续运行
+  python main.py --error-signal False     # 不屏蔽红外感应信号
 
 寄存器说明:
   D300: 间隔运行角度 (值=角度×100)
   D304: 运行速度 (值=速度×100)
-  D316: 延时时间 (秒)
-  D320: 模式 (0=间隔运行+延时)
+  D320: 模式 (1=间隔运行+触发)
+  D324: 机械轴当前位置
+  D332: 异常后继续运行模式 (0=继续, 1=复位, 2=默认)
   S400: 确认参数写入
-  S401: 启动自动运行
-  S403: 单次移动完成标志
+  S57746 (coilResume): 触发继续运行
+  S57747 (coilReady): 机械轴就绪信号
+  S57348 (coilMode): 模式切换 (0=自动, 1=手动)
+  S57649 (coilNoError): 屏蔽雷达告警
+  S57356 (coilErrorOccur): 错误发生标志
+  S57496 (coilRecover): 异常复位
+  S57494 (coilMachineStart): 手动模式启动
         """
     )
     
@@ -68,7 +76,22 @@ def main():
         '--delay', '-d',
         type=float,
         default=3.0,
-        help='每次旋转后的停顿时间，单位秒 (默认: 3)'
+        help='拍照后等待时间，单位秒 (默认: 3)'
+    )
+    
+    parser.add_argument(
+        '--error-signal',
+        type=bool,
+        default=True,
+        help='是否屏蔽红外感应信号 (默认: True)'
+    )
+    
+    parser.add_argument(
+        '--error-continue-model',
+        type=int,
+        default=2,
+        choices=[0, 1, 2],
+        help='异常处理模式: 0=继续运行, 1=回到起始位置, 2=默认 (默认: 2)'
     )
     
     parser.add_argument(
@@ -114,13 +137,16 @@ def main():
         
         # 显示配置信息
         print("=" * 60)
-        print("360度旋转控制系统")
+        print("360度旋转控制系统（模式1：间隔运行+触发）")
         print("=" * 60)
         print(f"PLC地址: {args.host}:{args.port}")
         print(f"旋转次数: {args.rotations}次")
         print(f"每次角度: {360.0/args.rotations:.2f}°")
         print(f"旋转速度: {args.speed}°/s")
-        print(f"停顿时间: {args.delay}秒")
+        print(f"拍照后等待: {args.delay}秒")
+        print(f"屏蔽红外信号: {args.error_signal}")
+        error_modes = {0: "继续运行", 1: "回到起始位置", 2: "默认"}
+        print(f"异常处理模式: {error_modes.get(args.error_continue_model, '未知')}")
         print("=" * 60)
         
         # 连接PLC
@@ -139,7 +165,9 @@ def main():
             rotations=args.rotations,
             speed=args.speed,
             delay=args.delay,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            error_signal=args.error_signal,
+            error_continue_model=args.error_continue_model
         )
         
         print("-" * 60)
