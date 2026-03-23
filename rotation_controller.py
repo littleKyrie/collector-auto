@@ -15,10 +15,7 @@ logger = logging.getLogger(__name__)
 # D寄存器（保持寄存器）
 D_SET_AUTO_ACTION_POSITION = 300    # 设置间隔运行角度
 D_SET_AUTO_ACTION_VELOCITY = 304    # 设置运行速度
-D_SET_MODEL_0_DELAY_TIMES = 316     # 设置模式0延时时间
 D_SET_MODEL_NUMBER = 320            # 设置模式参数
-D_GET_AUTO_ACTION_POSITION = 308    # 读取当前设置的间隔角度
-D_GET_AUTO_ACTION_VELOCITY = 312    # 读取当前的运行速度
 
 # 新增寄存器地址（模式1触发控制）
 D_REGISTER_POSITION = 324           # 机械轴角度位置
@@ -26,8 +23,6 @@ D_REGISTER_CONTINUE = 332           # 异常后继续运行模式，0-继续 1-�
 
 # S寄存器（线圈）
 S_SET_ENABLE_SET_VALUE = 57744      # 400+57344 确认值参数写入
-S_SET_AUTO_ACTION = 57745           # 401+57344 设置自动运行输入
-S_MOVE_DONE = 57747                 # 403+57344 分段内单次移动完成
 
 # 线圈地址常量（模式1触发控制）
 coilResume = 57746                  # 402+57344 暂停后重新执行（模式1使用）
@@ -115,7 +110,7 @@ class RotationController:
         
         # 检查单次角度是否超过INT范围限制（327.67°）
         if angle_per_step > 327.67:
-            return False, f"单次旋转角度{angle_per_step:.2f}°超过最大限制327.67°，请增加旋转次数"
+            return False, f"单次旋转角度{angle_per_step:.2f}°超过最大限制范围（327.67°），请增加旋转次数"
         
         return True, ""
     
@@ -130,157 +125,6 @@ class RotationController:
             float: 每次旋转角度
         """
         return 360.0 / rotations
-    
-    def configure_parameters(self, angle_per_step, speed, delay):
-        """
-        配置PLC参数
-        
-        Args:
-            angle_per_step: 每次旋转角度(°)
-            speed: 旋转速度(°/s)
-            delay: 延时时间(秒)
-            
-        Returns:
-            bool: 是否配置成功
-        """
-        try:
-            # 计算写入值（需要×100）
-            angle_value = int(angle_per_step * 100)
-            speed_value = int(speed * 100)
-            delay_value = int(delay)
-            mode_value = 0  # 模式0：间隔运行+延时
-            
-            logger.info(f"配置参数: 角度={angle_per_step:.2f}°({angle_value}), "
-                       f"速度={speed:.1f}°/s({speed_value}), "
-                       f"延时={delay}s({delay_value}), 模式={mode_value}")
-            
-            # 写入D300: 角度
-            if not self.client.write_register(D_SET_AUTO_ACTION_POSITION, angle_value):
-                logger.error("写入角度参数失败")
-                return False
-            
-            # 写入D304: 速度
-            if not self.client.write_register(D_SET_AUTO_ACTION_VELOCITY, speed_value):
-                logger.error("写入速度参数失败")
-                return False
-            
-            # 写入D316: 延时
-            if not self.client.write_register(D_SET_MODEL_0_DELAY_TIMES, delay_value):
-                logger.error("写入延时参数失败")
-                return False
-            
-            # 写入D320: 模式
-            if not self.client.write_register(D_SET_MODEL_NUMBER, mode_value):
-                logger.error("写入模式参数失败")
-                return False
-            
-            logger.info("参数配置成功")
-            return True
-            
-        except Exception as e:
-            logger.error(f"配置参数异常: {e}")
-            return False
-    
-    def confirm_parameters(self):
-        """
-        触发S400确认参数
-        
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            logger.info("确认参数写入...")
-            
-            # 写入S400=1触发参数生效
-            if not self.client.write_coil(S_SET_ENABLE_SET_VALUE, True):
-                logger.error("触发参数确认失败")
-                return False
-            
-            # 短暂延时确保参数生效
-            time.sleep(0.2)
-            
-            # 写入S400=0
-            self.client.write_coil(S_SET_ENABLE_SET_VALUE, False)
-            
-            logger.info("参数确认成功")
-            return True
-            
-        except Exception as e:
-            logger.error(f"确认参数异常: {e}")
-            return False
-    
-    def start_rotation(self):
-        """
-        触发S401启动运行
-        
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            logger.info("启动旋转...")
-            
-            # 写入S401=1启动运行
-            if not self.client.write_coil(S_SET_AUTO_ACTION, True):
-                logger.error("启动旋转失败")
-                return False
-            
-            # 短暂延时
-            time.sleep(0.1)
-            
-            # 写入S401=0
-            self.client.write_coil(S_SET_AUTO_ACTION, False)
-            
-            logger.info("旋转已启动")
-            return True
-            
-        except Exception as e:
-            logger.error(f"启动旋转异常: {e}")
-            return False
-    
-    def wait_for_move_done(self, timeout=60):
-        """
-        监控S403上升沿等待移动完成
-        
-        Args:
-            timeout: 超时时间(秒)
-            
-        Returns:
-            bool: 是否完成
-        """
-        try:
-            logger.debug("等待移动完成...")
-            
-            # 读取初始状态
-            last_state = self.client.read_coil(S_MOVE_DONE)
-            if last_state is None:
-                logger.error("读取Move_Done状态失败")
-                return False
-            
-            start_time = time.time()
-            
-            while True:
-                # 检查超时
-                if time.time() - start_time > timeout:
-                    logger.error("等待移动完成超时")
-                    return False
-                
-                # 读取当前状态
-                current_state = self.client.read_coil(S_MOVE_DONE)
-                if current_state is None:
-                    logger.error("读取Move_Done状态失败")
-                    return False
-                
-                # 检测上升沿（从False变为True）
-                if not last_state and current_state:
-                    logger.debug("检测到移动完成信号")
-                    return True
-                
-                last_state = current_state
-                time.sleep(0.1)  # 100ms轮询间隔
-                
-        except Exception as e:
-            logger.error(f"等待移动完成异常: {e}")
-            return False
     
     def run_rotation_sequence(self, rotations, speed, delay, progress_callback=None, 
                               error_signal=True, error_continue_model=errHandleModeDefault):
@@ -419,23 +263,6 @@ class RotationController:
                 error_thread.join(timeout=2)
                 if error_thread.is_alive():
                     logger.warning("错误检测线程未在2秒内停止")
-    
-    def stop_rotation(self):
-        """
-        停止运行
-        
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            logger.info("停止旋转...")
-            # 注意：根据文档，停止信号使用System_Stop (S151)
-            # 这里暂时不实现，因为自动模式下会自动停止
-            return True
-            
-        except Exception as e:
-            logger.error(f"停止旋转异常: {e}")
-            return False
     
     def reset_to_home(self):
         """

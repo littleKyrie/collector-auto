@@ -1,0 +1,13 @@
+name: cleanup-rotation-controller
+title: 清理 rotation_controller.py 中未使用的代码
+description: 删除未使用的方法和常量，简化代码库并提高可维护性
+status: proposed
+schema: spec-driven
+created: 2026-03-23
+author: AI Assistant
+tags:
+  - cleanup
+  - code-quality
+  - maintenance
+related:
+  - rotation-control
