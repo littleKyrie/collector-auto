@@ -62,7 +62,6 @@ S_COIL_ERROR_OCCUR = coilErrorOccur
 S_COIL_RECOVER = coilRecover
 S_COIL_MACHINE_START = coilMachineStart
 
-
 class RotationController:
     """旋转控制器类"""
     

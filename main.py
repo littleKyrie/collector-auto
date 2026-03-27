@@ -15,7 +15,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 def progress_callback(current, total):
     """
     进度显示回调函数
@@ -25,7 +24,6 @@ def progress_callback(current, total):
         total: 总次数
     """
     print(f"进度: {current}/{total} ({current*100//total}%)")
-
 
 def main():
     """主函数"""
