@@ -6,6 +6,8 @@
 import time
 import logging
 import threading
+import struct
+
 from modbus_client import ModbusClient
 
 # 配置日志
@@ -23,6 +25,7 @@ D_REGISTER_CONTINUE = 332           # 异常后继续运行模式，0-继续 1-�
 
 # S寄存器（线圈）
 S_SET_ENABLE_SET_VALUE = 57744      # 400+57344 确认值参数写入
+coilStart        = 57745            # 启动机械轴
 
 # 线圈地址常量（模式1触发控制）
 coilResume = 57746                  # 402+57344 暂停后重新执行（模式1使用）
@@ -61,6 +64,12 @@ S_COIL_NO_ERROR = coilNoError
 S_COIL_ERROR_OCCUR = coilErrorOccur
 S_COIL_RECOVER = coilRecover
 S_COIL_MACHINE_START = coilMachineStart
+
+# 模拟 Go 中的 binary.BigEndian.Uint16(res[0:2])
+def go_big_endian_uint16(data):
+    print(data)
+    # 使用 struct.unpack 解析大端序的16位无符号整数
+    return struct.unpack('>H', data)
 
 class RotationController:
     """旋转控制器类"""
@@ -165,15 +174,20 @@ class RotationController:
             # 3.2 实现红外感应信号屏蔽控制（coilNoError）
             if error_signal:
                 logger.info("屏蔽红外感应信号")
-                if not self.client.write_coil(coilNoError, True):
+                if not self.client.write_coil(coilNoError, coilValueTrue):
                     logger.error("屏蔽红外感应信号失败")
                     return False
             
+            mode_value = 1  # 模式1：间隔运行+触发
+            # 写入D320: 模式1
+            if not self.client.write_register(D_SET_MODEL_NUMBER, mode_value):
+                logger.error("写入模式参数失败")
+                return False
+
             # 3.3 实现模式1配置（D320=1）和参数写入（D300, D304）
             logger.info("配置模式1参数...")
             angle_value = int(self.angle_per_step * 100)
             speed_value = int(speed * 100)
-            mode_value = 1  # 模式1：间隔运行+触发
             
             # 写入D300: 角度
             if not self.client.write_register(D_SET_AUTO_ACTION_POSITION, angle_value):
@@ -185,18 +199,12 @@ class RotationController:
                 logger.error("写入速度参数失败")
                 return False
             
-            # 写入D320: 模式1
-            if not self.client.write_register(D_SET_MODEL_NUMBER, mode_value):
-                logger.error("写入模式参数失败")
-                return False
-            
+        
             # 3.4 实现参数确认（coilEnsure）
             logger.info("确认参数写入...")
-            if not self.client.write_coil(S_SET_ENABLE_SET_VALUE, True):
+            if not self.client.write_coil(S_SET_ENABLE_SET_VALUE, coilValueTrue):
                 logger.error("触发参数确认失败")
                 return False
-            time.sleep(0.2)
-            self.client.write_coil(S_SET_ENABLE_SET_VALUE, False)
             
             # 3.5 实现位置检测与复位调用（reset_to_home）
             logger.info("检查并复位到起始位置...")
@@ -204,21 +212,23 @@ class RotationController:
                 logger.error("复位到起始位置失败")
                 return False
             
-            # 3.6 实现手动模式启动调用（start_machine）
-            logger.info("手动模式启动设备...")
-            if not self.start_machine():
-                logger.error("启动设备失败")
-                return False
-            
+    
             # 3.7 启动异步错误检测线程（check_error）
-            logger.info("启动异步错误检测线程...")
-            error_thread = threading.Thread(
-                target=self.check_error,
-                args=(stop_event, error_continue_model)
-            )
-            error_thread.daemon = True
-            error_thread.start()
+            # logger.info("启动异步错误检测线程...")
+            # error_thread = threading.Thread(
+            #     target=self.check_error,
+            #     args=(stop_event, error_continue_model)
+            # )
+            # error_thread.daemon = True
+            # error_thread.start()
             
+            #机械轴启动
+            if not self.client.write_coil(coilStart, coilValueTrue):
+                logger.error("机械轴启动失败")
+                return False
+            time.sleep(1)
+            logger.error("机械轴启动成功")
+
             # 3.8 实现触发-等待-回调循环
             logger.info("开始触发-等待-回调循环...")
             for i in range(rotations):
@@ -226,16 +236,18 @@ class RotationController:
                 
                 # 发送coilResume触发旋转
                 logger.debug(f"发送coilResume信号（第{self.current_rotation}次）")
-                if not self.client.write_coil(coilResume, True):
+                if not self.client.write_coil(coilResume, coilValueTrue):
                     logger.error(f"发送coilResume失败")
                     return False
-                time.sleep(0.1)
-                self.client.write_coil(coilResume, False)
+                # time.sleep(0.1)
+                # self.client.write_coil(coilResume, False)
+                logger.info("发送机械臂继续转动信号成功！")
                 
                 # 等待coilReady机械轴就绪
-                if not self.wait_for_ready():
-                    logger.error(f"等待机械轴就绪超时（第{self.current_rotation}次）")
-                    return False
+                # if not self.wait_for_ready():
+                #     logger.error(f"等待机械轴就绪超时（第{self.current_rotation}次）")
+                #     return False
+                time.sleep((self.angle_per_step / self.speed)+2)
                 
                 # 执行回调（如拍照）
                 if self.progress_callback:
@@ -244,10 +256,10 @@ class RotationController:
                 
                 # 延时（用于拍照后等待）
                 if delay > 0:
+                    logger.info(f"{self.current_rotation}/{rotations} 拍照进行中....")
                     time.sleep(delay)
-                
-                logger.info(f"完成 {self.current_rotation}/{rotations}")
-            
+                    logger.info(f"{self.current_rotation}/{rotations} 拍照完成")
+                                
             logger.info("旋转序列完成")
             return True
             
@@ -263,6 +275,7 @@ class RotationController:
                 if error_thread.is_alive():
                     logger.warning("错误检测线程未在2秒内停止")
     
+    
     def reset_to_home(self):
         """
         检测机械轴当前位置，若不在起始位置则执行复位
@@ -273,26 +286,30 @@ class RotationController:
         try:
             # 读取当前位置
             result = self.client.read_register(D_REGISTER_POSITION, count=2)
-            if result is None:
+            res, error = result[0], result[1]
+            if error:
                 logger.error("读取机械轴位置失败")
                 return False
             
             # 解析角度值（大端序，2个寄存器）
-            cur_angle = (result[0] << 16) | result[1] if len(result) >= 2 else result[0]
+
+            cur_angle = int.from_bytes((res).to_bytes(2, 'big'), 'big')
+
             logger.info(f"当前机械轴位置: {cur_angle / 100:.2f}°")
             
+            wait_time = 1
             # 判断是否在起始位置附近（误差±1°，即±100）
             if cur_angle > 36010 or (cur_angle > 10 and cur_angle < 35990):
                 logger.info("机械轴未处于起始位置，执行复位...")
                 
                 # 切换自动模式（黄灯长亮）
-                if not self.client.write_coil(S_COIL_MODE, False):
+                if not self.client.write_coil(S_COIL_MODE, coilValueFalse):
                     logger.error("切换自动模式失败")
                     return False
-                time.sleep(1)
+                time.sleep(2)
                 
                 # 切换手动模式（绿灯长亮）
-                if not self.client.write_coil(S_COIL_MODE, True):
+                if not self.client.write_coil(S_COIL_MODE, coilValueTrue):
                     logger.error("切换手动模式失败")
                     return False
                 time.sleep(1)
@@ -300,7 +317,17 @@ class RotationController:
                 # 等待回到起始位置（估算时间）
                 wait_time = cur_angle / (self.speed * 100) if self.speed > 0 else 10
                 logger.info(f"等待复位完成，预计{wait_time:.1f}秒")
-                time.sleep(wait_time + 1)
+
+            # 发送启动信号
+            if not self.client.write_coil(coilMachineStart, coilValueTrue):
+                logger.error("发送启动信号失败")
+                return False
+            time.sleep(4)
+            
+            # 恢复启动信号
+            self.client.write_coil(coilMachineStart, coilValueFalse)
+
+            time.sleep(wait_time + 1)
             
             logger.info("机械轴已处于起始位置")
             return True
@@ -331,14 +358,14 @@ class RotationController:
                     return False
                 
                 # 读取coilReady状态
-                ready_state = self.client.read_coil(coilReady)
+                ready_state = self.client.read_coil(57448)
                 if ready_state is None:
                     logger.error("读取coilReady状态失败")
                     return False
-                
+                print("xxxxxxxxxxx", ready_state)
                 # 检测就绪信号
-                if ready_state:
-                    logger.debug("机械轴已就绪")
+                if not ready_state:
+                    logger.info(f"机械轴已就绪{ready_state},{time.time() - start_time}")
                     return True
                 
                 time.sleep(0.1)  # 100ms轮询间隔
@@ -378,7 +405,7 @@ class RotationController:
                     time.sleep(1)
                     continue
                 
-                # coilErrorOccur: 0-有错误，1-无错误
+                # coilErrorOccur: 0-有错误，1-无错误f
                 if error_state == coilResultFalse:
                     logger.error("检测到PLC错误!")
                     
@@ -415,34 +442,3 @@ class RotationController:
                 error_client.disconnect()
             logger.info("错误检测线程已停止")
     
-    def start_machine(self):
-        """
-        手动模式下启动设备
-        
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            logger.info("手动模式启动设备...")
-            
-            # 确保在手动模式
-            if not self.client.write_coil(coilMode, True):
-                logger.error("切换到手动模式失败")
-                return False
-            time.sleep(0.5)
-            
-            # 发送启动信号
-            if not self.client.write_coil(coilMachineStart, True):
-                logger.error("发送启动信号失败")
-                return False
-            time.sleep(0.1)
-            
-            # 恢复启动信号
-            self.client.write_coil(coilMachineStart, False)
-            
-            logger.info("设备启动成功")
-            return True
-            
-        except Exception as e:
-            logger.error(f"启动设备异常: {e}")
-            return False
