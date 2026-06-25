@@ -1,1 +1,13 @@
-pymodbus>=3.0.0
+# Runtime dependencies for the integrated camera, lens, and turntable controller.
+# Reference environment: Conda camera_control, Python 3.10.12, Windows x64.
+
+# Camera image-processing environment
+numpy==2.2.6
+opencv-python==4.12.0.88
+
+# Lens serial-port control
+pyserial==3.5
+
+# PLC turntable control over Modbus TCP.
+# 3.13.1 supports the device_id keyword used by modbus_client.py.
+pymodbus==3.13.1
