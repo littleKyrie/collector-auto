@@ -5,8 +5,15 @@
 import sys
 import argparse
 import logging
+import os
+import time
+
+# For plate controller
 from modbus_client import ModbusClient
 from rotation_controller import RotationController
+
+# For camera controller
+from ImageNode import *
 
 # 配置日志
 logging.basicConfig(
@@ -14,6 +21,21 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Lens map
+ANGLE_START = 0.0      # 起始端角度(靠近默认0点)
+ANGLE_END   = 2900.0   # 终点端角度
+
+# Utils
+def generate_step_angles(steps):
+    """根据步进次数，自动计算均分的物理角度列表"""
+    if steps <= 0: return []
+    if steps == 1: return [ANGLE_START]
+    angles = []
+    step_interval = (ANGLE_END - ANGLE_START) / (steps - 1)
+    for i in range(steps):
+        angles.append(round(ANGLE_START + (i * step_interval), 2))
+    return angles
 
 def progress_callback(current, total):
     """
@@ -111,6 +133,9 @@ def main():
         action='store_true',
         help='显示详细日志'
     )
+
+    # For lens control
+    parser.add_argument('--lens-steps', type=int, default=5, help=f'镜头变焦步进次数 (默认: 5)')
     
     args = parser.parse_args()
     
@@ -118,9 +143,60 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # 1. 生成相机的步进角度列表
+    target_angles = generate_step_angles(args.lens_steps)
+
+    # =========================================
+    # 步骤一：初始化相机硬件系统
+    # =========================================
+    print("\n[1/3] 正在初始化成像视觉系统...")
+    sys_dev = ImagingSystem()
+    sys_dev.init_system()
+    sys_dev.open_all()
+    # 执行镜头官方寻零
+    sys_dev.global_homing()
+
+    # =========================================
+    # 步骤二：连接 PLC 转台
+    # =========================================
     # 创建Modbus客户端
     client = ModbusClient(host=args.host, port=args.port)
+    print("\n[2/3] 正在连接PLC转台...")
+    if not client.connect():
+        print("错误: 无法连接到PLC，请检查网络连接和PLC状态")
+        sys_dev.close_all()
+        return 1
+    print("✅ PLC连接成功!")
+
+    # =========================================
+    # 步骤三：定义回调函数 (直接定义在 main 内部访问局部变量)
+    # =========================================
+    def progress_callback(current, total):
+        print(f"\n" + "="*55)
+        print(f"🔄 转台进度: {current}/{total} | 转台已就位，相机接管控制权...")
+        print("="*55)
+        
+        # 执行相机变焦与拍摄逻辑
+        for step_idx, target_angle in enumerate(target_angles):
+            print(f"\n 🎯 [阵位 {current} - 镜头步进 {step_idx + 1}/{len(target_angles)}] -> 目标角度: {target_angle}°")
+            
+            # 驱动镜头
+            sys_dev.serial_move_lenses(target_angle)
+            
+            # 镜头停稳后拍照，按照阵位和步进分文件夹保存
+            save_dir_base = os.path.abspath(f"./Output/Position_{current}/Step_{step_idx + 1}_Angle_{target_angle}")
+            sys_dev.serial_snap_all(save_dir_base)
+            
+        # 拍摄完毕，镜头平滑退回初始 0 点
+        print(f"\n 🔙 第 {current} 阵位拍摄完毕，镜头正在复位...")
+        sys_dev.serial_move_lenses(0.0)
+        
+        print(f"✅ 镜头复位完成，归还控制权给转台。")
+        print("="*55 + "\n")
     
+    # =========================================
+    # 步骤四：执行自动化联动循环
+    # =========================================
     try:
         # 创建旋转控制器
         controller = RotationController(client)
@@ -141,6 +217,7 @@ def main():
         print(f"旋转次数: {args.rotations}次")
         print(f"每次角度: {360.0/args.rotations:.2f}°")
         print(f"旋转速度: {args.speed}°/s")
+        print(f"镜头配置: 每阵位均分变焦 {args.lens_steps} 次")
         print(f"拍照后等待: {args.delay}秒")
         print(f"屏蔽红外信号: {args.error_signal}")
         error_modes = {0: "继续运行", 1: "回到起始位置", 2: "默认"}
@@ -156,7 +233,7 @@ def main():
         print("PLC连接成功!")
         
         # 开始旋转
-        print("\n开始执行旋转序列...")
+        print("\n[3/3] 开始执行旋转序列...")
         print("-" * 60)
         
         success = controller.run_rotation_sequence(
@@ -188,8 +265,11 @@ def main():
         
     finally:
         # 断开连接
+        # 清理所有资源
+        print("\n🧹 正在安全断开系统...")
         client.disconnect()
-        print("已断开PLC连接")
+        sys_dev.close_all()
+        print("✅ 系统已安全退出。")
 
 
 if __name__ == '__main__':
