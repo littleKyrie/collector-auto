@@ -82,28 +82,28 @@ def main():
         '--rotations', '-r',
         type=int,
         default=12,
-        help='旋转次数 (默认: 12次)'
+        help='转台旋转次数 (默认: 12次)'
     )
     
     parser.add_argument(
         '--speed', '-s',
         type=float,
         default=10.0,
-        help='旋转速度，单位°/s (默认: 10，范围: 0-30)'
+        help='转台旋转速度，单位°/s (默认: 10，范围: 0-30)'
     )
     
     parser.add_argument(
         '--delay', '-d',
         type=float,
         default=3.0,
-        help='拍照后等待时间，单位秒 (默认: 3)'
+        help='转台拍照后等待时间，单位秒 (默认: 3)'
     )
     
     parser.add_argument(
         '--error-signal',
         type=bool,
         default=True,
-        help='是否屏蔽红外感应信号 (默认: True)'
+        help='转台是否屏蔽红外感应信号 (默认: True)'
     )
     
     parser.add_argument(
@@ -111,7 +111,7 @@ def main():
         type=int,
         default=2,
         choices=[0, 1, 2],
-        help='异常处理模式: 0=继续运行, 1=回到起始位置, 2=默认 (默认: 2)'
+        help='转台异常处理模式: 0=继续运行, 1=回到起始位置, 2=默认 (默认: 2)'
     )
     
     parser.add_argument(
@@ -228,6 +228,7 @@ def main():
         print("\n正在连接PLC...")
         if not client.connect():
             print("错误: 无法连接到PLC，请检查网络连接和PLC状态")
+            sys_dev.close_all()
             return 1
         
         print("PLC连接成功!")

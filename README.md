@@ -339,3 +339,9 @@ python -m pip install pymodbus==3.13.1
 - 镜头串口打开、寻零、绝对移动、状态读取和回零。
 - PLC 寄存器读写、线圈读写和完整旋转序列。
 - 多阵位、多焦段完整采集及退出清理。
+
+### 项目打包
+
+```cmd
+python -m pip install pyinstaller
+pyinstaller --add-data "Runtime;Runtime" --add-data "MVSDK;MVSDK" --runtime-hook add_mvsdk_path.py --hidden-import platform --hidden-import IMVApi main.py
