@@ -154,7 +154,8 @@ def main():
     sys_dev.init_system()
     sys_dev.open_all()
     # 执行镜头官方寻零
-    sys_dev.global_homing()
+    # sys_dev.serial_global_homing()
+    sys_dev.parallel_global_homing()
 
     # =========================================
     # 步骤二：连接 PLC 转台
@@ -181,15 +182,18 @@ def main():
             print(f"\n 🎯 [阵位 {current} - 镜头步进 {step_idx + 1}/{len(target_angles)}] -> 目标角度: {target_angle}°")
             
             # 驱动镜头
-            sys_dev.serial_move_lenses(target_angle)
+            # sys_dev.serial_move_lenses(target_angle)
+            sys_dev.parallel_move_lenses(target_angle)
             
             # 镜头停稳后拍照，按照阵位和步进分文件夹保存
             save_dir_base = os.path.abspath(f"./Output/Position_{current}/Step_{step_idx + 1}_Angle_{target_angle}")
-            sys_dev.serial_snap_all(save_dir_base)
+            # sys_dev.serial_snap_all(save_dir_base)
+            sys_dev.parallel_snap_all(save_dir_base)
             
         # 拍摄完毕，镜头平滑退回初始 0 点
         print(f"\n 🔙 第 {current} 阵位拍摄完毕，镜头正在复位...")
-        sys_dev.serial_move_lenses(0.0)
+        # sys_dev.serial_move_lenses(0.0)
+        sys_dev.parallel_move_lenses(0.0)
         
         print(f"✅ 镜头复位完成，归还控制权给转台。")
         print("="*55 + "\n")
@@ -225,13 +229,13 @@ def main():
         print("=" * 60)
         
         # 连接PLC
-        print("\n正在连接PLC...")
-        if not client.connect():
-            print("错误: 无法连接到PLC，请检查网络连接和PLC状态")
-            sys_dev.close_all()
-            return 1
-        
-        print("PLC连接成功!")
+        # print("\n正在连接PLC...")
+        # if not client.connect():
+        #     print("错误: 无法连接到PLC，请检查网络连接和PLC状态")
+        #     sys_dev.close_all()
+        #     return 1
+        #
+        # print("PLC连接成功!")
         
         # 开始旋转
         print("\n[3/3] 开始执行旋转序列...")

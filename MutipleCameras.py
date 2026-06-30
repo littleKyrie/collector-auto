@@ -50,7 +50,8 @@ def main():
     sys_dev.open_all()
 
     # 3. 硬件上电找0及标定
-    sys_dev.global_homing()
+    # sys_dev.serial_global_homing()
+    sys_dev.parallel_global_homing()
 
     # 4. 自动化生产大循环
     for r in range(1, rounds + 1):

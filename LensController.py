@@ -78,7 +78,7 @@ class LensController:
 
         print(f"🔍 [{self.port}] 开始轮询检查归零是否达标...")
         homing_success = False
-        max_retries = 4  # 最多重复查询 4 次
+        max_retries = 2  # 最多重复查询 2 次
         
         for attempt in range(max_retries):
             status, real_angle = self.read_motor_status_and_position()

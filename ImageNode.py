@@ -76,11 +76,25 @@ class ImagingSystem:
             node.close_node()
         print("✅ 所有相机和镜头均已关闭。")
 
-    def global_homing(self):
+    def serial_global_homing(self):
         print("\n⚙️  ================ 执行系统全局绝对归零 ================")
         for node in self.nodes:
             if node.lens:
                 node.lens.initialize_lens()
+        print("✅  所有镜头全局归零完毕！绝对物理坐标系已确立。")
+
+    def parallel_global_homing(self):
+        print("\n⚙️  ================ 并发执行系统全局绝对归零 ================")
+        nodes_with_lens = [node for node in self.nodes if node.lens]
+
+        if not nodes_with_lens:
+            print(" ⚠️ 没有可初始化的镜头。")
+            return
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes_with_lens)) as executor:
+            futures = [executor.submit(node.lens.initialize_lens) for node in nodes_with_lens]
+            concurrent.futures.wait(futures)
+
         print("✅  所有镜头全局归零完毕！绝对物理坐标系已确立。")
 
     def serial_move_lenses(self, target_angle):
@@ -110,7 +124,7 @@ class ImagingSystem:
         print(" 📸 正在依次触发拍摄并写入磁盘...")
         for node in self.nodes:
             cam_name = node.camera.m_userId
-            save_path = os.path.join(save_dir_base, f"{cam_name}.jpg")
+            save_path = os.path.join(save_dir_base, f"{cam_name}.bmp")
             
             t0 = time.time()
             ret = node.camera.snap_and_save(save_path)
@@ -120,3 +134,34 @@ class ImagingSystem:
                 print(f"    ✅ [{cam_name}] 保存成功 (耗时: {t1-t0:.2f}s) -> {save_path}")
             else:
                 print(f"    ❌ [{cam_name}] 保存失败！错误码: {ret}")
+
+    def parallel_snap_all(self, save_dir_base):
+        os.makedirs(save_dir_base, exist_ok=True)
+        print(" 📸 正在并发触发拍摄并写入磁盘...")
+
+        nodes = list(self.nodes)
+        if not nodes:
+            print(" ⚠️ 没有可拍摄的相机节点。")
+            return
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as executor:
+            futures = []
+            for node in nodes:
+                cam_name = node.camera.m_userId
+                save_path = os.path.join(save_dir_base, f"{cam_name}.bmp")
+                t0 = time.time()
+                future = executor.submit(node.camera.snap_and_save, save_path)
+                futures.append((cam_name, save_path, t0, future))
+
+            for cam_name, save_path, t0, future in futures:
+                try:
+                    ret = future.result()
+                except Exception as exc:
+                    print(f"    ❌ [{cam_name}] 保存异常: {exc}")
+                    continue
+
+                t1 = time.time()
+                if ret == IMV_OK:
+                    print(f"    ✅ [{cam_name}] 保存成功 (耗时: {t1-t0:.2f}s) -> {save_path}")
+                else:
+                    print(f"    ❌ [{cam_name}] 保存失败！错误码: {ret}")

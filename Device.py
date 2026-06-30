@@ -98,8 +98,8 @@ class CameraDevice():
         saveImageParam.ePixelFormat = frame.frameInfo.pixelFormat
         saveImageParam.pSrcData = frame.pData
         saveImageParam.nSrcDataLen = frame.frameInfo.size
-        saveImageParam.nBayerDemosaic = 2
-        saveImageParam.nQuality = 90 # JPEG 压缩质量 0-100
+        saveImageParam.eBayerDemosaic = 2
+        saveImageParam.nQuality = 90 # JPEG 压缩质量 0-100，BMP 不使用该参数
         
         # 分配目标内存缓存：宽 * 高 * 4 (给足最大可能的数据量空间)
         buf_size = frame.frameInfo.width * frame.frameInfo.height * 4
