@@ -16,9 +16,10 @@ CAMERA_COM_MAP = {
 }
 
 class ImagingNode:
-    def __init__(self, cam_index, cam_info):
+    def __init__(self, cam_index, cam_info, lens_coordinate_mode='software'):
         self.camera = CameraDevice()
         self.camera.init(cam_index, cam_info)
+        self.lens_coordinate_mode = lens_coordinate_mode
         
         cam_name = self.camera.m_userId
         com_port = CAMERA_COM_MAP.get(cam_name, None)
@@ -27,7 +28,7 @@ class ImagingNode:
             print(f"⚠️ 警告: 未在映射表中找到相机 [{cam_name}] 对应的串口号！镜头不可控。")
             self.lens = None
         else:
-            self.lens = LensController(port=com_port)
+            self.lens = LensController(port=com_port, coordinate_mode=self.lens_coordinate_mode)
 
     def open_node(self):
         cam_ret = self.camera.openDevice()
@@ -52,8 +53,9 @@ class ImagingNode:
 
 
 class ImagingSystem:
-    def __init__(self):
+    def __init__(self, lens_coordinate_mode='software'):
         self.nodes = []
+        self.lens_coordinate_mode = lens_coordinate_mode
 
     def init_system(self):
         deviceList = IMV_DeviceList()
@@ -64,7 +66,7 @@ class ImagingSystem:
 
         print(f"🔍 找到 {deviceList.nDevNum} 台相机。正在初始化成像节点...")
         for i in range(deviceList.nDevNum):
-            node = ImagingNode(i, deviceList.pDevInfo[i])
+            node = ImagingNode(i, deviceList.pDevInfo[i], lens_coordinate_mode=self.lens_coordinate_mode)
             self.nodes.append(node)
 
     def open_all(self):

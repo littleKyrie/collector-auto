@@ -136,6 +136,12 @@ def main():
 
     # For lens control
     parser.add_argument('--lens-steps', type=int, default=5, help=f'镜头变焦步进次数 (默认: 5)')
+    parser.add_argument(
+        '--lens-coordinate-mode',
+        choices=['software', 'hardware'],
+        default='software',
+        help='镜头坐标模式: software=软件坐标默认模式, hardware=硬件清零后使用电机内部角度'
+    )
     
     args = parser.parse_args()
     
@@ -150,7 +156,7 @@ def main():
     # 步骤一：初始化相机硬件系统
     # =========================================
     print("\n[1/3] 正在初始化成像视觉系统...")
-    sys_dev = ImagingSystem()
+    sys_dev = ImagingSystem(lens_coordinate_mode=args.lens_coordinate_mode)
     sys_dev.init_system()
     sys_dev.open_all()
     # 执行镜头官方寻零
@@ -222,6 +228,7 @@ def main():
         print(f"每次角度: {360.0/args.rotations:.2f}°")
         print(f"旋转速度: {args.speed}°/s")
         print(f"镜头配置: 每阵位均分变焦 {args.lens_steps} 次")
+        print(f"镜头坐标模式: {args.lens_coordinate_mode}")
         print(f"拍照后等待: {args.delay}秒")
         print(f"屏蔽红外信号: {args.error_signal}")
         error_modes = {0: "继续运行", 1: "回到起始位置", 2: "默认"}
