@@ -10,8 +10,8 @@ import sys
 # TODO: 修改为实际连接的相机名称和对应的串口
 CAMERA_COM_MAP = {
     "1号": "COM7",
-    "2号": "COM8",
-    "3号": "COM9",
+    "2号": "COM9",
+    "3号": "COM8",
     "4号": "COM10",
 }
 
