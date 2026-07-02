@@ -8,7 +8,7 @@ import logging
 import os
 import time
 
-# For plate controller
+# Plate controller
 from modbus_client import ModbusClient
 from rotation_controller import RotationController
 
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 ANGLE_START = 0.0      # 起始端角度(靠近默认0点)
 ANGLE_END   = 2900.0   # 终点端角度
 
+# Mode id
 MODE_EXIT = 0
 MODE_FOCUS_RANGE_CALIBRATION = 1
 MODE_ROTATION_MULTI_SHOT = 2
@@ -37,9 +38,9 @@ MODE2_RUN = "run"
 ROTATION_MULTI_SHOT_PARAM_SPECS = {
     "rotations": {
         "label": "旋转次数",
-        "description": "整数，建议大于 0",
+        "description": "整数，大于等于 0",
         "type": int,
-        "min": 1,
+        "min": 0,
     },
     "speed": {
         "label": "转台旋转速度",
@@ -67,7 +68,7 @@ ROTATION_MULTI_SHOT_PARAM_SPECS = {
     },
     "host": {
         "label": "PLC IP 地址",
-        "description": "字符串，例如 192.168.1.88",
+        "description": "字符串，默认 192.168.1.88",
         "type": str,
     },
     "port": {
@@ -79,13 +80,13 @@ ROTATION_MULTI_SHOT_PARAM_SPECS = {
     },
     "lens_steps": {
         "label": "镜头变焦步进次数",
-        "description": "整数，建议大于 0",
+        "description": "整数，大于 0",
         "type": int,
         "min": 1,
     },
     "lens_coordinate_mode": {
         "label": "镜头坐标模式",
-        "description": "software/hardware",
+        "description": "程序/镜头硬件变量记录旋转角度",
         "type": str,
         "choices": ["software", "hardware"],
     },
@@ -115,7 +116,7 @@ def progress_callback(current, total):
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description='360度旋转控制脚本 - 控制PLC执行自动化旋转（模式1：间隔运行+触发）',
+        description='360度旋转控制脚本 - 控制PLC执行自动化旋转 - 旋转间隔控制相机拍照（模式1：间隔运行+触发）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
