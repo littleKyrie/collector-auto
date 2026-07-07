@@ -9,10 +9,10 @@ import sys
 
 # TODO: 修改为实际连接的相机名称和对应的串口
 CAMERA_COM_MAP = {
-    "1号": "COM7",
-    "2号": "COM9",
-    "3号": "COM8",
-    "4号": "COM10",
+    "1": "COM7",
+    "4": "COM9",
+    "3": "COM8",
+    "2": "COM10",
 }
 
 class ImagingNode:
@@ -120,6 +120,50 @@ class ImagingSystem:
             concurrent.futures.wait(futures)
             
         print(" ✅ 所有镜头均已同步到位。")
+
+    def serial_move_lenses_by_camera(self, target_angles_by_camera):
+        print("\n ⚙️ 正在按相机名串行下发镜头目标角度...")
+        for node in self.nodes:
+            cam_name = node.camera.m_userId
+            if not node.lens:
+                print(f" ⚠️ [{cam_name}] 没有可控镜头，跳过。")
+                continue
+            if cam_name not in target_angles_by_camera:
+                print(f" ⚠️ [{cam_name}] 缺少目标角度，跳过。")
+                continue
+            target_angle = target_angles_by_camera[cam_name]
+            print(f"    -> [{cam_name}] 目标角度: {target_angle}°")
+            node.lens.move_to_absolute_angle(target_angle)
+        print(" ✅ 按相机名串行移动完成。")
+
+    def parallel_move_lenses_by_camera(self, target_angles_by_camera):
+        print("\n ⚙️ 正在按相机名并发下发镜头目标角度...")
+        nodes_with_targets = [
+            node for node in self.nodes
+            if node.lens and node.camera.m_userId in target_angles_by_camera
+        ]
+
+        if not nodes_with_targets:
+            print(" ⚠️ 没有可控镜头或没有匹配的目标角度。")
+            return
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes_with_targets)) as executor:
+            futures = []
+            for node in nodes_with_targets:
+                cam_name = node.camera.m_userId
+                target_angle = target_angles_by_camera[cam_name]
+                print(f"    -> [{cam_name}] 目标角度: {target_angle}°")
+                futures.append(executor.submit(node.lens.move_to_absolute_angle, target_angle))
+            concurrent.futures.wait(futures)
+
+        missing = [
+            node.camera.m_userId for node in self.nodes
+            if node.lens and node.camera.m_userId not in target_angles_by_camera
+        ]
+        for cam_name in missing:
+            print(f" ⚠️ [{cam_name}] 缺少目标角度，未移动。")
+
+        print(" ✅ 按相机名并发移动完成。")
 
     def serial_snap_all(self, save_dir_base):
         os.makedirs(save_dir_base, exist_ok=True)
