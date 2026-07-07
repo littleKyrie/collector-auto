@@ -1,1 +1,0 @@
-('D:\\collector-auto-camera_control\\build\\main\\PYZ-00.pyz', [])
