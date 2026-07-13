@@ -19,3 +19,8 @@ sscom51.ini
 
 # Temporary Office lock files
 document/~$*
+
+# Agent
+.agent/
+.trae/
+
