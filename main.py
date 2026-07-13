@@ -326,8 +326,8 @@ def build_full_shot_parser():
   source="default" 的条目会作为可用范围使用，并在控制台提示。
 
 输出:
-  图片输出到 Output/Position_{current}/Step_{step_idx + 1}
-  每个 step 的相机目标角度写入 metadata JSON。
+  图片输出到 Output/{camera.user_id}/Position{i}_Step{j}.bmp
+  每个 step 的相机目标角度写入 log/full_shot/{run_timestamp}/Position{i}_Step{j}_metadata.json。
 
 寄存器说明:
   D300: 间隔运行角度 (值=角度×100)
@@ -455,6 +455,7 @@ def print_focus_calibration_help():
   float角度           相对当前位置继续旋转，可正可负。推荐先 1000，再 100，最后 10。
   ok                  接受当前电机内部绝对角度作为当前端点。
   home                让当前镜头回到 0 点并重新读取角度。
+  status              查看当前相机本轮已确认的端点 samples；未确认端点时显示默认参考范围。
   cancel              取消当前相机本轮标定，JSON 条目回退为默认未完成状态。
 
 完成后命令:
@@ -561,6 +562,86 @@ def validate_zero_angle(real_angle):
     return normalized
 
 
+def print_current_calibration_status(
+    camera_name,
+    endpoint_idx,
+    samples,
+    current_internal_angle,
+    default_samples,
+):
+    print(f"\n[{camera_name}] current calibration status")
+    print(f"  endpoint : {endpoint_idx}/2")
+    if current_internal_angle is None:
+        print("  current  : no valid internal angle yet")
+    else:
+        print(f"  current  : {current_internal_angle:.2f}°")
+
+    if samples:
+        formatted_samples = ", ".join(f"{sample:.2f}" for sample in samples)
+        print(f"  samples  : [{formatted_samples}]")
+        if len(samples) == 1:
+            print("  pending  : 1 endpoint remaining")
+    else:
+        formatted_defaults = ", ".join(f"{sample:.2f}" for sample in default_samples)
+        print("  samples  : none confirmed in this round")
+        print(f"  default  : [{formatted_defaults}]")
+    print()
+
+
+def classify_calibration_move(
+    start_angle,
+    relative_delta,
+    expected_angle,
+    measured_angle,
+    status_code,
+    result,
+):
+    try:
+        from LensController import LENS_BOUNDARY_ZERO
+    except Exception:
+        LENS_BOUNDARY_ZERO = 0xF5
+
+    if measured_angle is None:
+        return {
+            "kind": "normal",
+            "corrected_angle": None,
+            "corrected_expected_angle": expected_angle,
+            "message": "",
+        }
+
+    if result.get("boundary"):
+        kind = "zero_boundary" if status_code == LENS_BOUNDARY_ZERO else "far_boundary"
+        status_text = f"0x{status_code:02X}" if isinstance(status_code, int) else str(status_code)
+        return {
+            "kind": kind,
+            "corrected_angle": measured_angle,
+            "corrected_expected_angle": measured_angle,
+            "message": f"{boundary_hint(status_code)} raw_status={status_text}",
+        }
+
+    if (
+        relative_delta < 0
+        and expected_angle < 0
+        and abs(measured_angle) <= ZERO_VERIFY_TOLERANCE
+    ):
+        return {
+            "kind": "zero_boundary",
+            "corrected_angle": measured_angle,
+            "corrected_expected_angle": measured_angle,
+            "message": (
+                f"Reached zero boundary; corrected current angle to {measured_angle:.2f}°. "
+                "Enter a positive relative angle to leave the boundary, or ok to accept this endpoint."
+            ),
+        }
+
+    return {
+        "kind": "normal",
+        "corrected_angle": measured_angle,
+        "corrected_expected_angle": expected_angle,
+        "message": "",
+    }
+
+
 def calibrate_single_lens(camera_name, com_port, lens_registry, log_events):
     from LensController import LensController, COORDINATE_MODE_HARDWARE
 
@@ -591,7 +672,7 @@ def calibrate_single_lens(camera_name, com_port, lens_registry, log_events):
             print("请输入相对当前位置的角度，可正可负；推荐调试步长 1000、100、10。")
 
             while True:
-                raw = input(f"[{camera_name}] 端点 {endpoint_idx} 输入角度 / ok / home / cancel: ").strip()
+                raw = input(f"[{camera_name}] 端点 {endpoint_idx} 输入角度 / ok / home / status / cancel: ").strip()
                 lowered = raw.lower()
 
                 if lowered == "cancel":
@@ -606,6 +687,16 @@ def calibrate_single_lens(camera_name, com_port, lens_registry, log_events):
                     print(f"✅ 已回到 0 点，当前内部绝对角度: {current_internal_angle:.2f}°")
                     continue
 
+                if lowered == "status":
+                    print_current_calibration_status(
+                        camera_name=camera_name,
+                        endpoint_idx=endpoint_idx,
+                        samples=samples,
+                        current_internal_angle=current_internal_angle,
+                        default_samples=[ANGLE_START, ANGLE_END],
+                    )
+                    continue
+
                 if lowered == "ok":
                     if current_internal_angle is None:
                         print("尚未读取到有效内部角度，请先输入相对角度移动或 home。")
@@ -618,10 +709,11 @@ def calibrate_single_lens(camera_name, com_port, lens_registry, log_events):
                 try:
                     relative_delta = float(raw)
                 except ValueError:
-                    print("输入无效：请输入 float 相对角度，或 ok/home/cancel。")
+                    print("输入无效：请输入 float 相对角度，或 ok/home/status/cancel。")
                     continue
 
-                expected_target_angle = current_internal_angle + relative_delta
+                start_internal_angle = current_internal_angle
+                expected_target_angle = start_internal_angle + relative_delta
                 result = lens.move_relative_for_calibration(relative_delta)
 
                 try:
@@ -636,6 +728,28 @@ def calibrate_single_lens(camera_name, com_port, lens_registry, log_events):
                     print(f"当前电机内部绝对角度: {measured_angle:.2f}°")
                 else:
                     print(f"当前电机内部绝对角度读取失败，状态: {status_code}")
+
+                classification = classify_calibration_move(
+                    start_angle=start_internal_angle,
+                    relative_delta=relative_delta,
+                    expected_angle=expected_target_angle,
+                    measured_angle=measured_angle,
+                    status_code=status_code,
+                    result=result,
+                )
+                if classification["kind"] in ("zero_boundary", "far_boundary"):
+                    corrected_angle = classification["corrected_angle"]
+                    if corrected_angle is not None:
+                        current_internal_angle = corrected_angle
+                        lens.current_angle = corrected_angle
+                    expected_target_angle = classification["corrected_expected_angle"]
+                    print(f"⚠️ {classification['message']}")
+                    log_event(
+                        log_events,
+                        f"[{camera_name}] boundary: kind={classification['kind']}, "
+                        f"status={status_code}, expected={expected_target_angle}, angle={corrected_angle}",
+                    )
+                    continue
 
                 if result.get("boundary"):
                     print(f"⚠️ {boundary_hint(status_code)} 原始状态码=0x{status_code:02X}")
@@ -896,6 +1010,12 @@ def run_rotation_multi_shot(args):
         # =========================================
         # 步骤三：定义回调函数 (直接定义在模式2内部访问局部变量)
         # =========================================
+        output_root = os.path.abspath("./Output")
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        command_log_dir = FULL_SHOT_LOG_DIR
+        run_log_dir = os.path.join(command_log_dir, run_timestamp)
+        os.makedirs(run_log_dir, exist_ok=True)
+
         def progress_callback(current, total):
             print(f"\n" + "="*55)
             print(f"🔄 转台进度: {current}/{total} | 转台已就位，相机接管控制权...")
@@ -916,10 +1036,12 @@ def run_rotation_multi_shot(args):
                 # sys_dev.serial_move_lenses_by_camera(target_angles_by_camera)
                 sys_dev.parallel_move_lenses_by_camera(target_angles_by_camera)
 
-                # 镜头停稳后拍照，按照阵位和步进分文件夹保存
-                save_dir_base = os.path.abspath(f"./Output/Position_{current}/Step_{step_idx + 1}")
-                os.makedirs(save_dir_base, exist_ok=True)
-                metadata_path = os.path.join(save_dir_base, "lens_step_metadata.json")
+                # 镜头停稳后拍照；图片按相机目录保存，step metadata 写入 log
+                os.makedirs(run_log_dir, exist_ok=True)
+                metadata_path = os.path.join(
+                    run_log_dir,
+                    f"Position{current}_Step{step_idx + 1}_metadata.json",
+                )
                 with open(metadata_path, "w", encoding="utf-8") as f:
                     json.dump({
                         "position": current,
@@ -927,10 +1049,11 @@ def run_rotation_multi_shot(args):
                         "lens_steps": args.lens_steps,
                         "target_angles_by_camera": target_angles_by_camera,
                         "lens_range_map_path": LENS_RANGE_MAP_PATH,
+                        "image_path_pattern": "Output/{camera_user_id}/Position{i}_Step{j}.bmp",
                         "generated_at": timestamp(),
                     }, f, ensure_ascii=False, indent=2)
-                # sys_dev.serial_snap_all(save_dir_base)
-                sys_dev.parallel_snap_all(save_dir_base)
+                # sys_dev.serial_snap_rotation_step(output_root, current, step_idx + 1)
+                sys_dev.parallel_snap_rotation_step(output_root, current, step_idx + 1)
 
             # 拍摄完毕，镜头平滑退回初始 0 点
             print(f"\n 🔙 第 {current} 阵位拍摄完毕，镜头正在复位...")

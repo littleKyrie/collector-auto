@@ -346,6 +346,7 @@ class LensController:
                 "real_angle": None,
                 "boundary": False,
                 "error": "serial_not_open",
+                "requested_delta": delta_angle_deg,
             }
 
         if abs(delta_angle_deg) < 0.01:
@@ -356,6 +357,7 @@ class LensController:
                 "real_angle": real_angle,
                 "boundary": status in LENS_BOUNDARY_STATUSES,
                 "error": None if status == 0x00 else "status_not_ready",
+                "requested_delta": delta_angle_deg,
             }
 
         v_val = int(speed_rpm * self.encoder_res / 6000)
@@ -391,6 +393,7 @@ class LensController:
                     "real_angle": real_angle,
                     "boundary": True,
                     "error": None,
+                    "requested_delta": delta_angle_deg,
                 }
 
             if stopped and status == 0x00:
@@ -401,6 +404,7 @@ class LensController:
                     "real_angle": real_angle,
                     "boundary": False,
                     "error": None,
+                    "requested_delta": delta_angle_deg,
                 }
 
             return {
@@ -409,6 +413,7 @@ class LensController:
                 "real_angle": real_angle,
                 "boundary": False,
                 "error": "move_not_stopped",
+                "requested_delta": delta_angle_deg,
             }
 
         except Exception as e:
@@ -419,4 +424,5 @@ class LensController:
                 "real_angle": None,
                 "boundary": False,
                 "error": str(e),
+                "requested_delta": delta_angle_deg,
             }

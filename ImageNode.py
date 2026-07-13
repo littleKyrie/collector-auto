@@ -181,6 +181,57 @@ class ImagingSystem:
             else:
                 print(f"    ❌ [{cam_name}] 保存失败！错误码: {ret}")
 
+    def serial_snap_rotation_step(self, output_root, position_index, step_index, extension=".bmp"):
+        os.makedirs(output_root, exist_ok=True)
+        print(" Taking rotation step images serially...")
+        for node in self.nodes:
+            cam_name = node.camera.m_userId
+            save_dir = os.path.join(output_root, cam_name)
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"Position{position_index}_Step{step_index}{extension}")
+
+            t0 = time.time()
+            ret = node.camera.snap_and_save(save_path)
+            t1 = time.time()
+
+            if ret == IMV_OK:
+                print(f"    [{cam_name}] save ok ({t1-t0:.2f}s) -> {save_path}")
+            else:
+                print(f"    [{cam_name}] save failed, code: {ret}")
+
+    def parallel_snap_rotation_step(self, output_root, position_index, step_index, extension=".bmp"):
+        os.makedirs(output_root, exist_ok=True)
+        print(" Taking rotation step images in parallel...")
+
+        nodes = list(self.nodes)
+        if not nodes:
+            print(" No camera nodes available for capture.")
+            return
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as executor:
+            futures = []
+            for node in nodes:
+                cam_name = node.camera.m_userId
+                save_dir = os.path.join(output_root, cam_name)
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f"Position{position_index}_Step{step_index}{extension}")
+                t0 = time.time()
+                future = executor.submit(node.camera.snap_and_save, save_path)
+                futures.append((cam_name, save_path, t0, future))
+
+            for cam_name, save_path, t0, future in futures:
+                try:
+                    ret = future.result()
+                except Exception as exc:
+                    print(f"    [{cam_name}] save exception: {exc}")
+                    continue
+
+                t1 = time.time()
+                if ret == IMV_OK:
+                    print(f"    [{cam_name}] save ok ({t1-t0:.2f}s) -> {save_path}")
+                else:
+                    print(f"    [{cam_name}] save failed, code: {ret}")
+
     def parallel_snap_all(self, save_dir_base):
         os.makedirs(save_dir_base, exist_ok=True)
         print(" 📸 正在并发触发拍摄并写入磁盘...")
