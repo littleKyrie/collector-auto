@@ -9,10 +9,10 @@
 - 通过 Modbus TCP 控制 PLC 转台。
 - 根据旋转次数自动计算单次转台角度：`360° / rotations`。
 - 通过串口控制电动镜头寻零、绝对角度移动和回零。
-- 使用工业相机软件触发模式采集并保存 JPEG 图片。
+- 使用工业相机软件触发模式采集并保存 BMP 图片。
 - 每个转台阵位支持多个镜头焦段拍摄。
 - 支持多相机和多镜头节点。
-- 按阵位、镜头步进和镜头角度组织输出目录。
+- 按相机名称、阵位和镜头步进组织输出图片。
 - 任务结束或程序退出时关闭相机、镜头和 PLC 连接。
 
 ## 当前执行流程
@@ -147,16 +147,22 @@ Unit/Device ID: 1
 
 ## 使用方法
 
-查看全部参数：
+查看顶层模式：
 
 ```powershell
 python main.py --help
 ```
 
+查看旋转拍摄参数：
+
+```powershell
+python main.py --full_shot --help
+```
+
 使用默认参数运行：
 
 ```powershell
-python main.py
+python main.py --full_shot
 ```
 
 默认配置为：
@@ -171,19 +177,27 @@ python main.py
 自定义运行示例：
 
 ```powershell
-python main.py --rotations 24 --speed 5 --delay 2 --lens-steps 7
+python main.py --full_shot --rotations 24 --speed 5 --delay 2 --lens-steps 7
 ```
 
 连接其他 PLC：
 
 ```powershell
-python main.py --host 192.168.1.100 --port 502
+python main.py --full_shot --host 192.168.1.100 --port 502
 ```
 
 显示详细日志：
 
 ```powershell
-python main.py --verbose
+python main.py --full_shot --verbose
+```
+
+指定图片输出目录和镜头范围配置文件：
+
+```powershell
+python main.py --full_shot `
+  --output_path C://results `
+  --config_path C://camera-configs/lens_range_map.json
 ```
 
 ### 命令行参数
@@ -198,9 +212,11 @@ python main.py --verbose
 | `--port` | `-p` | `502` | PLC Modbus TCP 端口 |
 | `--error-signal` | - | `True` | 是否屏蔽红外感应信号 |
 | `--error-continue-model` | - | `2` | PLC 异常处理模式：0=继续，1=复位，2=默认 |
+| `--output_path` | - | 项目根目录下的 `Output` | 图片输出根目录；正式拍摄前清空其中的旧内容 |
+| `--config_path` | - | 项目根目录下的 `configs/lens_range_map.json` | 本次拍摄读取的镜头范围配置文件 |
 | `--verbose` | `-v` | 关闭 | 输出详细日志 |
 
-注意：当前 `--error-signal` 使用 `argparse` 的 `type=bool`。命令行字符串 `"False"` 仍可能被解析为真值，因此在修正参数定义前不建议依赖该参数从命令行关闭屏蔽。
+相对形式的 `output_path` 和 `config_path` 都以项目根目录为基准解析。`config_path` 是具体 JSON 文件路径，不是目录路径。
 
 ## 图片输出
 
@@ -208,21 +224,33 @@ python main.py --verbose
 
 ```text
 Output/
-└── Position_1/
-    ├── Step_1_Angle_0.0/
-    │   └── 1号.jpg
-    ├── Step_2_Angle_725.0/
-    │   └── 1号.jpg
+├── 1/
+│   ├── Position1_Step1.bmp
+│   ├── Position1_Step2.bmp
+│   └── ...
+└── 2/
+    ├── Position1_Step1.bmp
+    ├── Position1_Step2.bmp
     └── ...
 ```
 
 目录含义：
 
-- `Position_N`：第 N 个转台阵位。
-- `Step_N_Angle_X`：该阵位的第 N 个镜头步进及目标角度。
-- 图片文件名：相机 SDK 返回的相机名称。
+- 第一层目录名是相机 SDK 返回的当前相机名，例如 `1`、`2`。
+- `Position{i}` 表示第 `i` 个转台阵位。
+- `Step{j}` 表示该阵位的第 `j` 个镜头步进。
+- 图片格式保持为 BMP。
 
-重复使用相同参数运行时，同路径、同名称的图片可能被覆盖。正式采集前建议清理输出目录，或后续在路径中加入任务编号和时间戳。
+每次正式拍摄前，程序会清空本次选定的图片输出根目录，然后在其中重新创建相机子目录。该清理在一轮任务中只执行一次，不会在阵位或镜头步进之间重复执行。
+
+为避免误删，盘符根目录、文件系统根目录、项目根目录、符号链接/junction 根目录，以及包含本次 `config_path` 的目录不能作为 `output_path`。如果清理失败，拍摄不会启动。
+
+自定义输出示例 `--output_path C://results` 会生成：
+
+```text
+C://results/1/Position1_Step1.bmp
+C://results/2/Position1_Step1.bmp
+```
 
 ## PLC 寄存器与线圈
 

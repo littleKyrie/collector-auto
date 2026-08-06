@@ -7,6 +7,8 @@ import argparse
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 from datetime import datetime
 
@@ -29,6 +31,9 @@ ANGLE_START = 0.0      # 起始端角度(靠近默认0点)
 ANGLE_END   = 2900.0   # 终点端角度
 
 # Reference files
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_OUTPUT_PATH = os.path.join(PROJECT_ROOT, "Output")
+DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "configs", "lens_range_map.json")
 LENS_RANGE_MAP_PATH = os.path.join("configs", "lens_range_map.json")
 FOCAL_CALI_LOG_DIR = os.path.join("log", "focal_cali")
 FULL_SHOT_LOG_DIR = os.path.join("log", "full_shot")
@@ -63,6 +68,140 @@ def ensure_parent_dir(path):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def resolve_project_path(path):
+    """将命令行路径规范化为绝对路径；相对路径以项目根目录为基准。"""
+    if path is None or not str(path).strip():
+        raise ValueError("路径不能为空")
+
+    expanded_path = os.path.expandvars(os.path.expanduser(str(path).strip()))
+    if not os.path.isabs(expanded_path):
+        expanded_path = os.path.join(PROJECT_ROOT, expanded_path)
+    return os.path.abspath(os.path.normpath(expanded_path))
+
+
+def _same_path(first, second):
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(os.path.abspath(second))
+
+
+def _is_path_inside(path, parent):
+    try:
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        normalized_parent = os.path.normcase(os.path.abspath(parent))
+        return os.path.commonpath([normalized_path, normalized_parent]) == normalized_parent
+    except ValueError:
+        # Windows 上不同盘符没有共同路径。
+        return False
+
+
+def _is_junction(path):
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
+
+
+def validate_output_directory_path(output_root, project_root=PROJECT_ROOT, config_path=None):
+    """校验待清理的输出目录，拒绝根目录和会删除配置文件的路径。"""
+    output_root = resolve_project_path(output_root)
+    project_root = os.path.abspath(project_root)
+
+    if os.path.dirname(output_root) == output_root:
+        raise ValueError(f"拒绝使用文件系统根目录作为输出目录: {output_root}")
+    if _same_path(output_root, project_root):
+        raise ValueError(f"拒绝使用项目根目录作为输出目录: {output_root}")
+    if os.path.lexists(output_root) and (os.path.islink(output_root) or _is_junction(output_root)):
+        raise ValueError(f"拒绝使用符号链接或 junction 作为输出根目录: {output_root}")
+    if os.path.exists(output_root) and not os.path.isdir(output_root):
+        raise ValueError(f"图片输出路径不是目录: {output_root}")
+
+    if config_path:
+        config_path = resolve_project_path(config_path)
+        if _same_path(output_root, config_path) or _is_path_inside(config_path, output_root):
+            raise ValueError(
+                "输出目录不能包含镜头配置文件，否则清理输出时会删除配置: "
+                f"output={output_root}, config={config_path}"
+            )
+
+    return output_root
+
+
+def _remove_output_entry(path):
+    """删除输出目录的一个直接子项，不跟随目录链接或 junction。"""
+    if os.path.islink(path):
+        if os.name == "nt" and os.path.isdir(path):
+            os.rmdir(path)
+        else:
+            os.unlink(path)
+        return
+    if _is_junction(path):
+        os.rmdir(path)
+        return
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+        return
+    os.unlink(path)
+
+
+def prepare_output_directory(output_root, project_root=PROJECT_ROOT, config_path=None):
+    """创建或清空 full_shot 图片输出根目录，并验证目录可写。"""
+    output_root = validate_output_directory_path(output_root, project_root, config_path)
+    created = not os.path.exists(output_root)
+    if created:
+        os.makedirs(output_root, exist_ok=False)
+
+    with os.scandir(output_root) as iterator:
+        entries = list(iterator)
+    for entry in entries:
+        try:
+            _remove_output_entry(entry.path)
+        except OSError as exc:
+            raise OSError(f"清理输出目录失败: {entry.path}: {exc}") from exc
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix=".full_shot_write_test_",
+            dir=output_root,
+            delete=True,
+        ) as probe:
+            probe.write("write test")
+            probe.flush()
+    except OSError as exc:
+        raise OSError(f"图片输出目录不可写: {output_root}: {exc}") from exc
+
+    if created:
+        state = "created"
+    elif entries:
+        state = "cleared"
+    else:
+        state = "empty"
+    return output_root, state, len(entries)
+
+
+def metadata_path(path):
+    """将实际路径转换为适合写入 JSON metadata 的稳定形式。"""
+    return os.path.normpath(path).replace("\\", "/")
+
+
+def load_full_shot_lens_range_map(config_path):
+    """读取 full_shot 配置；文件缺失时保留现有默认焦距范围行为。"""
+    if not os.path.exists(config_path):
+        print(f"⚠️ Lens map 不存在，将使用默认焦距范围: {config_path}")
+        return {}
+    if not os.path.isfile(config_path):
+        raise ValueError(f"镜头配置路径不是文件: {config_path}")
+
+    try:
+        data = load_lens_range_map(config_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"读取镜头配置失败: {config_path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"镜头配置顶层必须是 JSON 对象: {config_path}")
+    lens_ranges = data.get("lens_ranges", {})
+    if not isinstance(lens_ranges, dict):
+        raise ValueError(f"镜头配置 lens_ranges 必须是 JSON 对象: {config_path}")
+    return data
 
 
 def default_lens_record(camera_name, serial_port):
@@ -318,15 +457,18 @@ def build_full_shot_parser():
   python main.py --full_shot --rotations 24 --speed 5 --delay 2
   python main.py --full_shot --host 192.168.1.100 --lens-steps 3
   python main.py --full_shot --error-continue-model 0 --error-signal false
+  python main.py --full_shot --output_path C://results --config_path C://camera-configs/lens_range_map.json
 
 镜头范围:
-  默认读取 configs/lens_range_map.json。
+  默认读取项目根目录下的 configs/lens_range_map.json，也可通过 --config_path 指定配置文件。
   每台相机使用自己条目中的 angle_start/angle_end 生成镜头步进。
   如果 JSON 不存在、相机缺少条目或条目未完成，会提示并使用默认范围 0.0/2900.0。
   source="default" 的条目会作为可用范围使用，并在控制台提示。
 
 输出:
-  图片输出到 Output/{camera.user_id}/Position{i}_Step{j}.bmp
+  图片默认输出到项目根目录下的 Output/{camera.user_id}/Position{i}_Step{j}.bmp。
+  可通过 --output_path 指定图片输出根目录。
+  正式拍摄前会清空所选图片输出根目录中的全部旧内容。
   每个 step 的相机目标角度写入 log/full_shot/{run_timestamp}/Position{i}_Step{j}_metadata.json。
 
 寄存器说明:
@@ -402,6 +544,20 @@ def build_full_shot_parser():
         help='显示详细日志'
     )
 
+    parser.add_argument(
+        '--output_path',
+        type=str,
+        default=DEFAULT_OUTPUT_PATH,
+        help='图片输出根目录；拍摄前会清空目录内容 (默认: 项目根目录/Output)'
+    )
+
+    parser.add_argument(
+        '--config_path',
+        type=str,
+        default=DEFAULT_CONFIG_PATH,
+        help='镜头范围配置文件 (默认: 项目根目录/configs/lens_range_map.json)'
+    )
+
     # For lens control
     parser.add_argument('--lens-steps', type=int, default=5, help=f'镜头变焦步进次数 (默认: 5)')
     parser.add_argument(
@@ -416,7 +572,19 @@ def build_full_shot_parser():
 
 def parse_args(argv=None):
     """解析 full_shot 命令行参数"""
-    return build_full_shot_parser().parse_args(argv)
+    parser = build_full_shot_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.output_path = resolve_project_path(args.output_path)
+        args.config_path = resolve_project_path(args.config_path)
+        validate_output_directory_path(
+            args.output_path,
+            project_root=PROJECT_ROOT,
+            config_path=args.config_path,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def print_focus_calibration_help():
@@ -956,6 +1124,15 @@ def run_rotation_multi_shot(args):
     client = None
 
     try:
+        output_root = resolve_project_path(getattr(args, "output_path", DEFAULT_OUTPUT_PATH))
+        config_path = resolve_project_path(getattr(args, "config_path", DEFAULT_CONFIG_PATH))
+        output_root = validate_output_directory_path(
+            output_root,
+            project_root=PROJECT_ROOT,
+            config_path=config_path,
+        )
+        lens_range_map = load_full_shot_lens_range_map(config_path)
+
         from ImageNode import ImagingSystem
 
         # =========================================
@@ -965,7 +1142,6 @@ def run_rotation_multi_shot(args):
         sys_dev = ImagingSystem(lens_coordinate_mode=args.lens_coordinate_mode)
         sys_dev.init_system()
 
-        lens_range_map = load_lens_range_map() or {}
         lens_ranges = lens_range_map.get("lens_ranges", {})
         per_lens_step_angles = {}
 
@@ -1010,11 +1186,15 @@ def run_rotation_multi_shot(args):
         # =========================================
         # 步骤三：定义回调函数 (直接定义在模式2内部访问局部变量)
         # =========================================
-        output_root = os.path.abspath("./Output")
         run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         command_log_dir = FULL_SHOT_LOG_DIR
         run_log_dir = os.path.join(command_log_dir, run_timestamp)
         os.makedirs(run_log_dir, exist_ok=True)
+        image_path_pattern = metadata_path(os.path.join(
+            output_root,
+            "{camera_user_id}",
+            "Position{i}_Step{j}.bmp",
+        ))
 
         def progress_callback(current, total):
             print(f"\n" + "="*55)
@@ -1038,18 +1218,18 @@ def run_rotation_multi_shot(args):
 
                 # 镜头停稳后拍照；图片按相机目录保存，step metadata 写入 log
                 os.makedirs(run_log_dir, exist_ok=True)
-                metadata_path = os.path.join(
+                metadata_file_path = os.path.join(
                     run_log_dir,
                     f"Position{current}_Step{step_idx + 1}_metadata.json",
                 )
-                with open(metadata_path, "w", encoding="utf-8") as f:
+                with open(metadata_file_path, "w", encoding="utf-8") as f:
                     json.dump({
                         "position": current,
                         "step_index": step_idx + 1,
                         "lens_steps": args.lens_steps,
                         "target_angles_by_camera": target_angles_by_camera,
-                        "lens_range_map_path": LENS_RANGE_MAP_PATH,
-                        "image_path_pattern": "Output/{camera_user_id}/Position{i}_Step{j}.bmp",
+                        "lens_range_map_path": metadata_path(config_path),
+                        "image_path_pattern": image_path_pattern,
                         "generated_at": timestamp(),
                     }, f, ensure_ascii=False, indent=2)
                 # sys_dev.serial_snap_rotation_step(output_root, current, step_idx + 1)
@@ -1089,6 +1269,8 @@ def run_rotation_multi_shot(args):
         print(f"镜头坐标模式: {args.lens_coordinate_mode}")
         print(f"拍照后等待: {args.delay}秒")
         print(f"屏蔽红外信号: {args.error_signal}")
+        print(f"图片输出目录: {output_root}")
+        print(f"镜头配置文件: {config_path}")
         error_modes = {0: "继续运行", 1: "回到起始位置", 2: "默认"}
         print(f"异常处理模式: {error_modes.get(args.error_continue_model, '未知')}")
         print("=" * 60)
@@ -1102,6 +1284,19 @@ def run_rotation_multi_shot(args):
         #
         # print("PLC连接成功!")
         
+        # 正式拍摄前只准备一次输出目录，避免旧图片与本次结果混合。
+        output_root, output_state, removed_count = prepare_output_directory(
+            output_root,
+            project_root=PROJECT_ROOT,
+            config_path=config_path,
+        )
+        if output_state == "created":
+            print(f"✅ 已创建图片输出目录: {output_root}")
+        elif output_state == "cleared":
+            print(f"✅ 已清空图片输出目录: {output_root}（移除 {removed_count} 个直接子项）")
+        else:
+            print(f"✅ 图片输出目录为空: {output_root}")
+
         # 开始旋转
         print("\n[3/3] 开始执行旋转序列...")
         print("-" * 60)
