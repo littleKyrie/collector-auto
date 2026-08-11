@@ -361,3 +361,202 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 6. 将 metadata 中的硬编码路径改为本次运行的实际路径。
 7. 增加路径与清理逻辑的无硬件测试。
 8. 更新 README，并执行帮助、单元测试和硬件联调验收。
+
+## 10. 镜头回零碰壁容差修复计划
+
+### 10.1 问题描述
+
+在 `full_shot` 模式下，每轮拍摄结束后镜头执行回零指令。回零时通过 `read_motor_status_and_position()` 查询电机状态，该函数是 `LensController` 中唯一的电机状态查询入口——不论是正常移动 (`move_to_absolute_angle`) 还是回零 (`return_to_home`)，都通过它获取状态码和内部角度。
+
+当前 `_wait_until_stopped` 对物理边界（`0x0B`/`0xF5`）的处理是**一律返回 `False`**。当镜头回零碰壁且 `real_angle ≈ -2.5°` 时，由于返回值 `False`：
+
+1. `return_to_home` 直接返回 `False`，不执行 `_set_software_zero()`，`current_angle` 保持旧值不变。
+2. `move_to_absolute_angle` 调用方 (`parallel_move_lenses`) 忽略返回值，不感知失败。
+3. 软件坐标与实际物理位置从此脱节。
+4. 后续阵位如果 target_angle 恰好等于旧的 `current_angle`（尤其是 `lens_steps=1` 时所有阵位目标角度相同），`move_to_absolute_angle` 在 `abs(delta) < 0.1` 处直接返回 `True`，不下发任何移动指令。该镜头在所有剩余阵位中物理上停滞在碰壁位置，但流程静默继续，产出的图片焦距完全错误。
+
+### 10.2 参考设计：`focus_calibration` 模式的边界容差
+
+焦距标定模式中对零点边界已有容差设计，位于 [main.py:759-810](main.py#L759-L810) 的 `classify_calibration_move`：
+
+```python
+# 情形一：电机直接报告边界状态
+if result.get("boundary"):
+    kind = "zero_boundary" if status_code == LENS_BOUNDARY_ZERO else "far_boundary"
+    return {
+        "kind": kind,
+        "corrected_angle": measured_angle,
+        "corrected_expected_angle": measured_angle,  # 用实测值修正期望值
+        ...
+    }
+
+# 情形二：电机未报告边界，但相对位移为负、期望角度为负、实测接近 0
+if (
+    relative_delta < 0
+    and expected_angle < 0
+    and abs(measured_angle) <= ZERO_VERIFY_TOLERANCE  # 1.0°
+):
+    return {
+        "kind": "zero_boundary",
+        "corrected_angle": measured_angle,
+        "corrected_expected_angle": measured_angle,
+        ...
+    }
+```
+
+核心思想：碰壁时**不视为错误**，而是用实测角度修正期望值，让调用方继续以实测位置作为新的基准进行后续操作。
+
+### 10.3 修复方案
+
+#### 10.3.1 新增容差常量
+
+在 `LensController.py` 中新增：
+
+```python
+# 回零/移动碰壁容差：当电机触碰物理边界，但内部角度与目标角度之差
+# 在此范围内时，视为已到位（以实测角度为准），不再报错。
+BOUNDARY_ANGLE_TOLERANCE = 5.0  # 度
+```
+
+该值与 `main.py` 中已有的 `ANGLE_VERIFY_TOLERANCE = 5.0` 语义一致，用于同一类"角度偏差可接受"的判断场景。
+
+#### 10.3.2 修改 `_wait_until_stopped`
+
+新增可选参数 `expected_angle` 和 `angle_tolerance`：
+
+```python
+def _wait_until_stopped(self, timeout_s=10.0, interval_s=0.5,
+                        expected_angle=None, angle_tolerance=None):
+```
+
+当检测到边界状态 (`0x0B`/`0xF5`) 时，增加容差判断：
+
+```python
+if status in (0x0B, 0xF5):
+    boundary_name = "零点边界" if status == 0xF5 else "远端边界"
+    print(f"⚠️ [{self.port}] 电机触碰物理{boundary_name}。状态={status}, 内部角度={real_angle}°")
+
+    if expected_angle is not None and real_angle is not None and angle_tolerance is not None:
+        if abs(real_angle - expected_angle) <= angle_tolerance:
+            print(f"✅ [{self.port}] 碰壁但内部角度在容差内 "
+                  f"(实测={real_angle:.2f}°, 期望={expected_angle:.2f}°, "
+                  f"偏差={abs(real_angle - expected_angle):.2f}° <= {angle_tolerance}°)，视为到位。")
+            return True, status, real_angle
+
+    return False, status, real_angle
+```
+
+#### 10.3.3 修改 `return_to_home`
+
+在调用 `_wait_until_stopped` 时传入期望角度 0.0 和容差：
+
+```python
+def return_to_home(self):
+    ...
+    self.send_command(LENS_RETURN_HOME_COMMAND, wait_time=0.5)
+
+    stopped, status, real_angle = self._wait_until_stopped(
+        timeout_s=10.0, interval_s=0.5,
+        expected_angle=0.0, angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
+    )
+    if not stopped:
+        print(f"❌ [{self.port}] 回 0 超时或异常！...")
+        return False
+
+    # 软件坐标模式：即使碰壁被容差通过，仍用实测角度校准 current_angle
+    if self.coordinate_mode == COORDINATE_MODE_SOFTWARE:
+        self._log_home_internal_angle(real_angle)
+        if real_angle is not None:
+            self.current_angle = real_angle  # 用实测值修正，不再无条件设 0.0
+            print(f"🎉 [{self.port}] 寻零完成，软件坐标已校准为 {real_angle:.2f}°。")
+        else:
+            self._set_software_zero()
+            print(f"🎉 [{self.port}] 寻零完成，软件坐标已设置为 0.0°。")
+        return True
+    ...
+```
+
+关键变化：软件坐标模式下不再无条件 `current_angle = 0.0`，而是优先采用实测 `real_angle`，这样当碰壁容差通过时（如 `real_angle = -2.5°`），后续阵位的 `delta_angle = target - (-2.5)` 能够正确算出正向位移，驱动镜头离开边界。
+
+#### 10.3.4 修改 `move_to_absolute_angle`
+
+在调用 `_wait_until_stopped` 时传入目标角度和容差：
+
+```python
+def move_to_absolute_angle(self, target_angle_deg, speed_rpm=LENS_SPEED_RPM):
+    ...
+    stopped, status, real_angle = self._wait_until_stopped(
+        timeout_s=4.0, interval_s=0.2,
+        expected_angle=target_angle_deg, angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
+    )
+    if not stopped:
+        print(f"❌ 主动查验超时或异常！...")
+        return False
+
+    if self.coordinate_mode == COORDINATE_MODE_SOFTWARE:
+        # 软件坐标模式：用实测值或目标值更新坐标
+        if real_angle is not None:
+            self.current_angle = real_angle
+            print(f"✅ 电机停稳。内部角度={real_angle:.2f}°，软件坐标已校准。")
+        else:
+            self.current_angle = target_angle_deg
+            print(f"✅ 电机停稳。软件坐标更新为 {target_angle_deg:.2f}°")
+        return True
+    ...
+```
+
+#### 10.3.5 `move_relative_for_calibration` —— 无需修改
+
+该函数仅在 `focus_calibration` 交互式标定中使用。其内部逻辑为：
+
+```python
+stopped, status, real_angle = self._wait_until_stopped(...)
+boundary = status in LENS_BOUNDARY_STATUSES
+
+if boundary:                    # ← 第一个判断分支
+    return {"ok": True, "boundary": True, ...}
+```
+
+由于 `boundary` 判断位于最前面，无论 `_wait_until_stopped` 返回 `stopped=True` 还是 `False`，只要 `status == 0xF5` 或 `0x0B`，就会进入边界分支，返回结构 `{"ok": True, "boundary": True}` 完全不变。上游 `classify_calibration_move` 的 `result.get("boundary")` 行为不受影响，且 `focus_calibration` 流程自身已有 `classify_calibration_move` 做交互级边界容差处理。**因此该函数不需要任何修改。**
+
+### 10.4 影响分析
+
+#### 正向影响
+
+- **回零碰壁自动恢复**：`real_angle ≈ -2.5°` 在 5° 容差内，视为成功。`current_angle` 更新为实测值，后续阵位的 `delta_angle` 计算正确，镜头能正常驱动离开边界。
+- **静默故障变为可见**：即使容差通过，日志也会输出 `碰壁但内部角度在容差内`，方便事后排查。
+- **正常移动碰壁同样受益**：`move_to_absolute_angle` 也加入了容差，即使非回零场景下轻微碰壁也能容错。
+
+#### 风险
+
+- **容差过大可能掩盖真正的硬件故障**：5° 对应约 455 个编码器脉冲（32768 分辨率下），如果镜头实际卡在非零点位置，容差可能将其误判为正常。但鉴于 `ANGLE_VERIFY_TOLERANCE` 在标定流程中已使用相同的 5° 阈值，该值属于经过实践检验的合理范围。
+
+### 10.5 预计影响文件
+
+- `LensController.py`
+  - 新增 `BOUNDARY_ANGLE_TOLERANCE` 常量。
+  - `_wait_until_stopped` 新增 `expected_angle` 和 `angle_tolerance` 可选参数及容差判断逻辑。
+  - `return_to_home`：传入容差参数；软件坐标模式改用 `real_angle` 校准 `current_angle`。
+  - `move_to_absolute_angle`：传入容差参数；软件坐标模式改用 `real_angle` 校准 `current_angle`。
+  - `move_relative_for_calibration`：无需修改（其 `boundary` 分支在最前，不受 `_wait_until_stopped` 返回值变化影响）。
+
+- `main.py`
+  - 无需修改。`full_shot` 调用方 (`parallel_move_lenses` 等) 不感知内部容差逻辑。
+
+### 10.6 验证计划
+
+1. **正常回零不受影响**：`status == 0x00` 时，容差分支不触发，行为与改造前完全一致。
+2. **碰壁容差通过**：模拟或实际触发 `status == 0xF5, real_angle = -2.5°`，验证 `return_to_home` 返回 `True`，`current_angle` 更新为 `-2.5°`，控制台输出 `碰壁但内部角度在容差内`。
+3. **碰壁容差不通过**：模拟 `real_angle = -10°`（超出 5° 容差），验证 `return_to_home` 返回 `False`，行为与改造前一致。
+4. **后续阵位正常驱动**：容差通过后，下一个阵位的 `move_to_absolute_angle(2000°)` 计算 `delta = 2000 - (-2.5) = 2002.5°`，正确下发正向移动指令，镜头离开边界。
+5. **焦距标定兼容**：执行 `focus_calibration` 流程的交互式标定，验证边界碰壁提示和容差行为无退化。
+6. **远端边界不受影响**：`status == 0x0B` 远端边界时，如果 `real_angle` 在容差范围内，同样可通过容差检查；超出容差则保持原有失败行为。
+
+### 10.7 实施顺序
+
+1. 在 `LensController.py` 新增 `BOUNDARY_ANGLE_TOLERANCE` 常量。
+2. 修改 `_wait_until_stopped`，增加 `expected_angle`/`angle_tolerance` 可选参数和容差判断。
+3. 修改 `return_to_home`，传入容差参数并改用 `real_angle` 校准软件坐标。
+4. 修改 `move_to_absolute_angle`，传入容差参数并优先使用 `real_angle` 更新坐标。
+5. 确认 `move_relative_for_calibration` 无需修改（其 `boundary` 判断路径不受影响）。
+6. 硬件联调验证：正常回零、碰壁容差通过、碰壁容差不通过、后续阵位驱动恢复、标定兼容。
