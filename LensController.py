@@ -16,6 +16,10 @@ LENS_BOUNDARY_ZERO = 0xF5
 LENS_BOUNDARY_FAR = 0x0B
 LENS_BOUNDARY_STATUSES = {LENS_BOUNDARY_ZERO, LENS_BOUNDARY_FAR}
 
+# 回零/移动碰壁容差：当电机触碰物理边界，但内部角度与目标角度之差
+# 在此范围内时，视为已到位（以实测角度为准），不再报错。
+BOUNDARY_ANGLE_TOLERANCE = 5.0  # 度
+
 COORDINATE_MODE_SOFTWARE = 'software'
 COORDINATE_MODE_HARDWARE = 'hardware'
 VALID_COORDINATE_MODES = {COORDINATE_MODE_SOFTWARE, COORDINATE_MODE_HARDWARE}
@@ -101,7 +105,8 @@ class LensController:
     def _set_software_zero(self):
         self.current_angle = 0.0
 
-    def _wait_until_stopped(self, timeout_s=10.0, interval_s=0.5):
+    def _wait_until_stopped(self, timeout_s=10.0, interval_s=0.5,
+                            expected_angle=None, angle_tolerance=None):
         start_t = time.time()
         last_status = -1
         last_angle = None
@@ -115,7 +120,17 @@ class LensController:
                 return True, status, real_angle
 
             if status in (0x0B, 0xF5):
-                print(f"⚠️ [{self.port}] 电机触碰物理边界。状态={status}, 内部角度={real_angle}°")
+                boundary_name = "零点边界" if status == 0xF5 else "远端边界"
+                print(f"⚠️ [{self.port}] 电机触碰物理{boundary_name}。状态=0x{status:02X}, 内部角度={real_angle}°")
+
+                if expected_angle is not None and real_angle is not None and angle_tolerance is not None:
+                    deviation = abs(real_angle - expected_angle)
+                    if deviation <= angle_tolerance:
+                        print(f"✅ [{self.port}] 碰壁但内部角度在容差内 "
+                              f"(实测={real_angle:.2f}°, 期望={expected_angle:.2f}°, "
+                              f"偏差={deviation:.2f}° <= {angle_tolerance}°)，视为到位。")
+                        return True, status, real_angle
+
                 return False, status, real_angle
 
             if status in (0x01, 0xFF):
@@ -193,7 +208,10 @@ class LensController:
         print(f"🔙 [{self.port}] 正在执行官方【点击回0】指令...")
         self.send_command(LENS_RETURN_HOME_COMMAND, wait_time=0.5)
 
-        stopped, status, real_angle = self._wait_until_stopped(timeout_s=10.0, interval_s=0.5)
+        stopped, status, real_angle = self._wait_until_stopped(
+            timeout_s=10.0, interval_s=0.5,
+            expected_angle=0.0, angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
+        )
         if not stopped:
             print(f"❌ [{self.port}] 回 0 超时或异常！状态={status}, 最后内部角度={real_angle}°，软件角度={self.current_angle:.2f}°")
             return False
@@ -205,7 +223,12 @@ class LensController:
 
         if self.coordinate_mode == COORDINATE_MODE_SOFTWARE:
             self._log_home_internal_angle(real_angle)
-            self._set_software_zero()
+            if real_angle is not None:
+                self.current_angle = real_angle
+                print(f"🎉 [{self.port}] 寻零完成，软件坐标已校准为 {real_angle:.2f}°。")
+            else:
+                self._set_software_zero()
+                print(f"🎉 [{self.port}] 寻零完成，软件坐标已设置为 0.0°。")
             return True
 
         if not self._maybe_set_hardware_zero():
@@ -312,17 +335,21 @@ class LensController:
             print(f"      ...指令下发，执行大段静默等待: {bulk_sleep_time:.2f}s...")
             time.sleep(bulk_sleep_time)
 
-            stopped, status, real_angle = self._wait_until_stopped(timeout_s=4.0, interval_s=0.2)
+            stopped, status, real_angle = self._wait_until_stopped(
+                timeout_s=4.0, interval_s=0.2,
+                expected_angle=target_angle_deg, angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
+            )
             if not stopped:
                 print(f"\n      ❌ [{self.port}] 主动查验超时或异常！状态={status}, 内部角度={real_angle}°，软件角度={self.current_angle:.2f}°")
                 return False
 
             if self.coordinate_mode == COORDINATE_MODE_SOFTWARE:
                 if real_angle is not None:
-                    print(f"\n      ✅ [{self.port}] 电机停稳。内部角度={real_angle:.2f}°，软件坐标更新为 {target_angle_deg:.2f}°")
+                    self.current_angle = real_angle
+                    print(f"\n      ✅ [{self.port}] 电机停稳。内部角度={real_angle:.2f}°，软件坐标已校准。")
                 else:
+                    self.current_angle = target_angle_deg
                     print(f"\n      ✅ [{self.port}] 电机停稳。软件坐标更新为 {target_angle_deg:.2f}°")
-                self.current_angle = target_angle_deg
                 return True
 
             if real_angle is not None and abs(real_angle - target_angle_deg) < 5.0:
