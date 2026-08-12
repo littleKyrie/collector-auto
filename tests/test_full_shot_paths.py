@@ -253,16 +253,42 @@ class FullShotIntegrationTests(unittest.TestCase):
                 def parallel_global_homing(self):
                     pass
 
-                def parallel_move_lenses_by_camera(self, target_angles):
-                    pass
+                def parallel_move_lenses_by_camera(self, target_angles, **kwargs):
+                    return {
+                        "ok": True,
+                        "successful": list(target_angles),
+                        "failed": {},
+                        "skipped": [],
+                    }
 
-                def parallel_move_lenses(self, target_angle):
-                    pass
+                def parallel_move_lenses(self, target_angle, **kwargs):
+                    return {
+                        "ok": True,
+                        "successful": ["1"],
+                        "failed": {},
+                        "skipped": [],
+                    }
 
-                def parallel_snap_rotation_step(self, root, position, step):
+                def parallel_snap_rotation_step(self, root, position, step, **kwargs):
                     camera_dir = os.path.join(root, "1")
                     os.makedirs(camera_dir, exist_ok=True)
                     Path(camera_dir, f"Position{position}_Step{step}.bmp").write_bytes(b"bmp")
+                    return {
+                        "ok": True,
+                        "successful": ["1"],
+                        "failed": {},
+                        "skipped": [],
+                    }
+
+                def get_full_shot_status(self):
+                    return {
+                        "1": {
+                            "camera": "1",
+                            "port": "COM7",
+                            "enabled": True,
+                            "position_quality": "confirmed",
+                        }
+                    }
 
                 def close_all(self):
                     pass

@@ -1196,12 +1196,23 @@ def run_rotation_multi_shot(args):
             "Position{i}_Step{j}.bmp",
         ))
 
+        def normalize_operation_summary(summary, default_successful=None):
+            if isinstance(summary, dict):
+                return summary
+            return {
+                "ok": True,
+                "successful": list(default_successful or []),
+                "failed": {},
+                "skipped": [],
+            }
+
         def progress_callback(current, total):
             print(f"\n" + "="*55)
             print(f"🔄 转台进度: {current}/{total} | 转台已就位，相机接管控制权...")
             print("="*55)
 
             # 执行相机变焦与拍摄逻辑
+            position_metadata_paths = []
             for step_idx in range(args.lens_steps):
                 target_angles_by_camera = {
                     cam_name: step_angles[step_idx]
@@ -1214,7 +1225,25 @@ def run_rotation_multi_shot(args):
 
                 # 驱动镜头
                 # sys_dev.serial_move_lenses_by_camera(target_angles_by_camera)
-                sys_dev.parallel_move_lenses_by_camera(target_angles_by_camera)
+                move_summary = normalize_operation_summary(
+                    sys_dev.parallel_move_lenses_by_camera(
+                        target_angles_by_camera,
+                        position=current,
+                        step=step_idx + 1,
+                    ),
+                    default_successful=target_angles_by_camera.keys(),
+                )
+
+                successful_cameras = move_summary.get("successful", [])
+                capture_summary = normalize_operation_summary(
+                    sys_dev.parallel_snap_rotation_step(
+                        output_root,
+                        current,
+                        step_idx + 1,
+                        camera_names=successful_cameras,
+                    ),
+                    default_successful=successful_cameras,
+                )
 
                 # 镜头停稳后拍照；图片按相机目录保存，step metadata 写入 log
                 os.makedirs(run_log_dir, exist_ok=True)
@@ -1222,25 +1251,57 @@ def run_rotation_multi_shot(args):
                     run_log_dir,
                     f"Position{current}_Step{step_idx + 1}_metadata.json",
                 )
-                with open(metadata_file_path, "w", encoding="utf-8") as f:
-                    json.dump({
+                step_metadata = {
                         "position": current,
                         "step_index": step_idx + 1,
                         "lens_steps": args.lens_steps,
                         "target_angles_by_camera": target_angles_by_camera,
+                        "active_cameras": capture_summary.get("successful", []),
+                        "skipped_cameras": sorted(set(
+                            move_summary.get("skipped", [])
+                            + list(move_summary.get("failed", {}).keys())
+                            + capture_summary.get("skipped", [])
+                            + list(capture_summary.get("failed", {}).keys())
+                        )),
+                        "lens_move_summary": move_summary,
+                        "capture_summary": capture_summary,
+                        "camera_status": sys_dev.get_full_shot_status(),
                         "lens_range_map_path": metadata_path(config_path),
                         "image_path_pattern": image_path_pattern,
                         "generated_at": timestamp(),
-                    }, f, ensure_ascii=False, indent=2)
-                # sys_dev.serial_snap_rotation_step(output_root, current, step_idx + 1)
-                sys_dev.parallel_snap_rotation_step(output_root, current, step_idx + 1)
+                    }
+                with open(metadata_file_path, "w", encoding="utf-8") as f:
+                    json.dump(step_metadata, f, ensure_ascii=False, indent=2)
+                position_metadata_paths.append(metadata_file_path)
 
             # 拍摄完毕，镜头平滑退回初始 0 点
             print(f"\n 🔙 第 {current} 阵位拍摄完毕，镜头正在复位...")
             # sys_dev.serial_move_lenses(0.0)
-            sys_dev.parallel_move_lenses(0.0)
+            home_summary = normalize_operation_summary(
+                sys_dev.parallel_move_lenses(
+                    0.0,
+                    position=current,
+                    step="home",
+                )
+            )
 
-            print(f"✅ 镜头复位完成，归还控制权给转台。")
+            if position_metadata_paths:
+                metadata_file_path = position_metadata_paths[-1]
+                with open(metadata_file_path, "r", encoding="utf-8") as f:
+                    last_step_metadata = json.load(f)
+                last_step_metadata["home_summary"] = home_summary
+                last_step_metadata["camera_status_after_home"] = sys_dev.get_full_shot_status()
+                with open(metadata_file_path, "w", encoding="utf-8") as f:
+                    json.dump(last_step_metadata, f, ensure_ascii=False, indent=2)
+
+            if home_summary.get("failed"):
+                print(
+                    f"⚠️ 镜头复位部分完成，已隔离 "
+                    f"{len(home_summary['failed'])} 台异常相机；其余相机继续，"
+                    f"归还控制权给转台。"
+                )
+            else:
+                print(f"✅ 活动镜头复位完成，归还控制权给转台。")
             print("="*55 + "\n")
 
         # =========================================
@@ -1314,6 +1375,20 @@ def run_rotation_multi_shot(args):
         
         if success:
             print("\n✓ 旋转完成!")
+            camera_status = sys_dev.get_full_shot_status()
+            isolated = {
+                name: status for name, status in camera_status.items()
+                if not status.get("enabled", True)
+            }
+            if isolated:
+                print(f"⚠️ 本次任务共隔离 {len(isolated)} 台相机：")
+                for cam_name, status in isolated.items():
+                    print(
+                        f"   - 相机{cam_name}/{status.get('port')}: "
+                        f"reason={status.get('failure_reason')}, "
+                        f"position={status.get('failed_at_position')}, "
+                        f"step={status.get('failed_at_step')}"
+                    )
             return 0
         else:
             print("\n✗ 旋转失败!")
