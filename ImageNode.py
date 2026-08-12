@@ -313,7 +313,7 @@ class ImagingSystem:
         print(" 📸 正在依次触发拍摄并写入磁盘...")
         for node in self.nodes:
             cam_name = node.camera.m_userId
-            save_path = os.path.join(save_dir_base, f"{cam_name}.bmp")
+            save_path = os.path.join(save_dir_base, f"{cam_name}.jpg")
             
             t0 = time.time()
             ret = node.camera.snap_and_save(save_path)
@@ -324,7 +324,7 @@ class ImagingSystem:
             else:
                 print(f"    ❌ [{cam_name}] 保存失败！错误码: {ret}")
 
-    def serial_snap_rotation_step(self, output_root, position_index, step_index, extension=".bmp"):
+    def serial_snap_rotation_step(self, output_root, position_index, step_index, extension=".jpg"):
         os.makedirs(output_root, exist_ok=True)
         print(" Taking rotation step images serially...")
         for node in self.nodes:
@@ -342,8 +342,12 @@ class ImagingSystem:
             else:
                 print(f"    [{cam_name}] save failed, code: {ret}")
 
+<<<<<<< HEAD
     def parallel_snap_rotation_step(self, output_root, position_index, step_index,
                                     extension=".bmp", camera_names=None):
+=======
+    def parallel_snap_rotation_step(self, output_root, position_index, step_index, extension=".jpg"):
+>>>>>>> d1c134c (change to jpg)
         os.makedirs(output_root, exist_ok=True)
         print(" Taking rotation step images in parallel...")
 
@@ -417,7 +421,7 @@ class ImagingSystem:
             futures = []
             for node in nodes:
                 cam_name = node.camera.m_userId
-                save_path = os.path.join(save_dir_base, f"{cam_name}.bmp")
+                save_path = os.path.join(save_dir_base, f"{cam_name}.jpg")
                 t0 = time.time()
                 future = executor.submit(node.camera.snap_and_save, save_path)
                 futures.append((cam_name, save_path, t0, future))

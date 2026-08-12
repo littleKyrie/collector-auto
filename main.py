@@ -466,7 +466,7 @@ def build_full_shot_parser():
   source="default" 的条目会作为可用范围使用，并在控制台提示。
 
 输出:
-  图片默认输出到项目根目录下的 Output/{camera.user_id}/Position{i}_Step{j}.bmp。
+  图片默认输出到项目根目录下的 Output/{camera.user_id}/Position{i}_Step{j}.jpg。
   可通过 --output_path 指定图片输出根目录。
   正式拍摄前会清空所选图片输出根目录中的全部旧内容。
   每个 step 的相机目标角度写入 log/full_shot/{run_timestamp}/Position{i}_Step{j}_metadata.json。
@@ -1131,6 +1131,7 @@ def run_rotation_multi_shot(args):
             project_root=PROJECT_ROOT,
             config_path=config_path,
         )
+        print(f"配置文件目录: {config_path}")
         lens_range_map = load_full_shot_lens_range_map(config_path)
 
         from ImageNode import ImagingSystem
@@ -1193,7 +1194,7 @@ def run_rotation_multi_shot(args):
         image_path_pattern = metadata_path(os.path.join(
             output_root,
             "{camera_user_id}",
-            "Position{i}_Step{j}.bmp",
+            "Position{i}_Step{j}.jpg",
         ))
 
         def normalize_operation_summary(summary, default_successful=None):
