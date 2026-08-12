@@ -342,12 +342,8 @@ class ImagingSystem:
             else:
                 print(f"    [{cam_name}] save failed, code: {ret}")
 
-<<<<<<< HEAD
-    def parallel_snap_rotation_step(self, output_root, position_index, step_index,
-                                    extension=".bmp", camera_names=None):
-=======
-    def parallel_snap_rotation_step(self, output_root, position_index, step_index, extension=".jpg"):
->>>>>>> d1c134c (change to jpg)
+    def parallel_snap_rotation_step(self, output_root, position_index, step_index, extension=".jpg", camera_names=None):
+
         os.makedirs(output_root, exist_ok=True)
         print(" Taking rotation step images in parallel...")
 
