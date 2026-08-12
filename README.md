@@ -373,3 +373,6 @@ python -m pip install pymodbus==3.13.1
 ```cmd
 python -m pip install pyinstaller
 pyinstaller --add-data "Runtime;Runtime" --add-data "MVSDK;MVSDK" --runtime-hook add_mvsdk_path.py --hidden-import platform --hidden-import IMVApi main.py
+
+新的打包指令：
+pyinstaller --clean --noconfirm --paths "." --paths "MVSDK" --add-data "Runtime;Runtime" --add-data "MVSDK;MVSDK" --add-data "configs;configs" --runtime-hook "add_MVSDK_path.py" --hidden-import "platform" --hidden-import "IMVApi" --hidden-import "ImageNode" --hidden-import "Device" --hidden-import "LensController" main.py
