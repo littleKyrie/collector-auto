@@ -362,201 +362,457 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 7. 增加路径与清理逻辑的无硬件测试。
 8. 更新 README，并执行帮助、单元测试和硬件联调验收。
 
-## 10. 镜头回零碰壁容差修复计划
+## 10. 镜头到位判定、回零恢复与故障隔离计划
 
-### 10.1 问题描述
+### 10.1 问题复盘与设计目标
 
-在 `full_shot` 模式下，每轮拍摄结束后镜头执行回零指令。回零时通过 `read_motor_status_and_position()` 查询电机状态，该函数是 `LensController` 中唯一的电机状态查询入口——不论是正常移动 (`move_to_absolute_angle`) 还是回零 (`return_to_home`)，都通过它获取状态码和内部角度。
+在 `full_shot` 模式下，每个阵位拍摄完成后，所有镜头都会执行官方“点击回 0”指令。现有日志中，2 号相机对应的 COM9 在回零阶段出现：
 
-当前 `_wait_until_stopped` 对物理边界（`0x0B`/`0xF5`）的处理是**一律返回 `False`**。当镜头回零碰壁且 `real_angle ≈ -2.5°` 时，由于返回值 `False`：
+```text
+状态=255，最后内部角度=-2.6477°，软件角度=2110.02°
+```
 
-1. `return_to_home` 直接返回 `False`，不执行 `_set_software_zero()`，`current_angle` 保持旧值不变。
-2. `move_to_absolute_angle` 调用方 (`parallel_move_lenses`) 忽略返回值，不感知失败。
-3. 软件坐标与实际物理位置从此脱节。
-4. 后续阵位如果 target_angle 恰好等于旧的 `current_angle`（尤其是 `lens_steps=1` 时所有阵位目标角度相同），`move_to_absolute_angle` 在 `abs(delta) < 0.1` 处直接返回 `True`，不下发任何移动指令。该镜头在所有剩余阵位中物理上停滞在碰壁位置，但流程静默继续，产出的图片焦距完全错误。
+这里的 `255` 是十六进制 `0xFF`，并不是 `0xF5`（`0xF5` 的十进制值为 245）。当前 `_wait_until_stopped()` 把 `0xFF` 当作运行状态，所以即使镜头已经停在零点附近，也会一直等待到超时。回零失败后又保留了旧的 `current_angle=2110.02°`；下一阵位目标仍为约 `2110°` 时，`move_to_absolute_angle()` 因 `abs(delta_angle) < 0.1` 直接返回成功，没有重新下发移动指令，最终导致焦距错误。
 
-### 10.2 参考设计：`focus_calibration` 模式的边界容差
+本次改造目标如下：
 
-焦距标定模式中对零点边界已有容差设计，位于 [main.py:759-810](main.py#L759-L810) 的 `classify_calibration_move`：
+1. 状态码仍作为首要证据，同时使用“目标角度误差 + 连续角度稳定”辅助判断到位。
+2. `0xFF` 不能因为单次角度落入容差就直接视为成功；只有连续稳定后才允许推断到位。
+3. 稳定性判断同时用于 `full_shot` 的回零和普通绝对角度移动，不检测速度，只检测连续角度样本。
+4. 回零阶段第一次失败后，按照厂商建议尝试一次“上电找 0 → 点击回 0”恢复；该恢复策略不得用于普通角度移动。
+5. 单个镜头最终失败时，默认隔离该相机及镜头，其他相机继续完成整段拍摄；程序不主动中断，用户需要停止整段任务时使用 `Ctrl+C`。
+6. 软件坐标必须带有效性和质量状态，禁止使用失败前的旧坐标静默跳过下一次移动。
+7. 所有并发操作必须收集并向上传播每台镜头的结构化结果，同时输出可定位问题的详细日志。
+8. `focus_calibration` 当前运行正常，必须保持其现有调用链、等待逻辑、返回结构和边界判定不变；本次增强只接入 `full_shot`。
+
+#### 10.1.1 `focus_calibration` 现有共享调用链
+
+`focus_calibration` 确实会共享当前 `_wait_until_stopped()`，调用链如下：
+
+```text
+calibrate_single_lens()
+├─ initialize_lens()
+│  └─ _wait_until_stopped()              # 初始化回零检查
+├─ return_to_home()                       # 交互命令 home
+│  └─ _wait_until_stopped()
+└─ move_relative_for_calibration()        # 标定相对移动
+   └─ _wait_until_stopped()
+```
+
+因此不能改变 `_wait_until_stopped()` 的默认语义或三元组返回结构；否则即使 `full_shot` 修复正确，也可能造成焦距标定流程回归。
+
+本次继续共享 `_wait_until_stopped()`、`return_to_home()` 和 `move_to_absolute_angle()`，不复制一套 `*_for_full_shot` 方法。共享函数通过可选策略参数区分行为，默认值始终是原有策略：
 
 ```python
-# 情形一：电机直接报告边界状态
-if result.get("boundary"):
-    kind = "zero_boundary" if status_code == LENS_BOUNDARY_ZERO else "far_boundary"
-    return {
-        "kind": kind,
-        "corrected_angle": measured_angle,
-        "corrected_expected_angle": measured_angle,  # 用实测值修正期望值
-        ...
-    }
-
-# 情形二：电机未报告边界，但相对位移为负、期望角度为负、实测接近 0
-if (
-    relative_delta < 0
-    and expected_angle < 0
-    and abs(measured_angle) <= ZERO_VERIFY_TOLERANCE  # 1.0°
+def _wait_until_stopped(
+    self,
+    timeout_s=10.0,
+    interval_s=0.5,
+    expected_angle=None,
+    angle_tolerance=None,
+    wait_policy="legacy",
+    normal_timeout_s=None,
+    hard_timeout_s=None,
+    operation=None,
 ):
-    return {
-        "kind": "zero_boundary",
-        "corrected_angle": measured_angle,
-        "corrected_expected_angle": measured_angle,
-        ...
-    }
 ```
 
-核心思想：碰壁时**不视为错误**，而是用实测角度修正期望值，让调用方继续以实测位置作为新的基准进行后续操作。
+- `wait_policy="legacy"`：执行当前判断顺序、日志和等待行为，继续返回 `(stopped, status, real_angle)`；
+- `wait_policy="full_shot"`：在同一函数中启用目标误差、连续稳定、正常超时和硬超时，返回结构仍是同一个三元组；
+- full-shot 分支的详细诊断结果写入 `full_shot_last_wait_result`，供上一层读取；
+- `focus_calibration` 的现有调用代码不传新参数，因此自动进入 `legacy` 分支。
 
-### 10.3 修复方案
-
-#### 10.3.1 新增容差常量
-
-在 `LensController.py` 中新增：
+以下 focus_calibration 代码段保持原样，不增加策略参数，也不修改返回值处理：
 
 ```python
-# 回零/移动碰壁容差：当电机触碰物理边界，但内部角度与目标角度之差
-# 在此范围内时，视为已到位（以实测角度为准），不再报错。
+# initialize_lens()
+stopped, status, real_angle = self._wait_until_stopped(
+    timeout_s=2.0, interval_s=0.5,
+)
+
+# return_to_home() 在默认 legacy 策略下的现有调用
+stopped, status, real_angle = self._wait_until_stopped(
+    timeout_s=10.0,
+    interval_s=0.5,
+    expected_angle=0.0,
+    angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
+)
+
+# move_relative_for_calibration()
+stopped, status, real_angle = self._wait_until_stopped(
+    timeout_s=4.0, interval_s=0.2,
+)
+```
+
+`return_to_home()` 和 `move_to_absolute_angle()` 只增加默认值为 `legacy` 的可选 `wait_policy` 参数，并继续返回现有布尔值。focus_calibration 仍按原代码调用 `return_to_home()`；ImageNode 的 full-shot 并发路径显式调用 `move_to_absolute_angle(..., wait_policy="full_shot")`。目标角度为 0 时，`move_to_absolute_angle()` 必须把策略继续传给 `return_to_home(wait_policy=wait_policy)`，避免意外回落到 legacy 分支。
+
+full-shot 启动时仍复用原 `initialize_lens()` 完成硬件初始化。初始化成功后，由 `ImageNode.parallel_global_homing()` 上层根据已经校准的 `current_angle` 建立 `full_shot_position_valid=True` 和 `full_shot_position_quality="confirmed"`；初始化失败则隔离对应相机。`initialize_lens()` 本身及其 focus_calibration 行为保持不变。
+
+### 10.2 状态码与成功条件
+
+当前已知状态按以下方式处理：
+
+| 状态 | 当前含义 | 处理原则 |
+|---|---|---|
+| `0x00` | 正常停稳 | 只有实测角度也在目标容差内才确认成功；角度不符时返回“停稳但位置不符” |
+| `0x01` | 运行中 | 继续轮询；若角度已进入目标容差，可以进入稳定候选，但不能单次成功 |
+| `0xFF` | 当前代码视为运行中；现场可能出现状态滞留 | 继续轮询；目标附近连续稳定后允许标记为“推断到位” |
+| `0xF5` | 当前映射为零点边界 | 回零时角度在零点容差内则确认成功；普通移动时必须结合目标和运动方向判断 |
+| `0x0B` | 当前映射为远端边界 | 普通移动时必须结合目标和运动方向判断；回零阶段原则上视为异常 |
+| `-1` | 未读取到有效帧 | 记录串口读取失败次数；连续失败或达到绝对超时后返回故障 |
+| 其他状态 | 未知 | 详细记录原始状态，达到策略规定条件后返回未知状态故障 |
+
+所有状态日志统一同时输出十六进制和十进制，例如：
+
+```text
+status=0xFF (255)
+status=0xF5 (245)
+```
+
+负角度本身不能直接等价为回零成功。它只能说明编码器实测位置已经接近或越过内部零点。回零成功仍需满足以下任一条件：
+
+- `0x00` 且实测角度在回零容差内；
+- `0xF5` 且实测角度在回零容差内；
+- `0x01`/`0xFF` 且实测角度在回零容差内，并在稳定窗口内连续稳定。
+
+### 10.3 全局可调参数
+
+所有到位判定和恢复参数统一放在 `LensController.py` 顶部、现有 `BOUNDARY_ANGLE_TOLERANCE` 附近，并逐项写明单位、用途和现场调参影响。建议初始值如下，最终数值以硬件联调为准：
+
+```python
+# 物理边界角度容差；用于判断边界状态对应的位置是否合理。
 BOUNDARY_ANGLE_TOLERANCE = 5.0  # 度
+
+# 回零目标角度容差；允许编码器在机械零点附近存在负值、回差或轻微偏移。
+HOME_ANGLE_TOLERANCE = 5.0  # 度
+
+# 普通绝对角度移动的到位容差；应比回零容差更严格，避免影响焦距精度。
+MOVE_ANGLE_TOLERANCE = 2.0  # 度
+
+# 连续角度稳定所需时间；候选样本必须覆盖至少该时长才能推断到位。
+POSITION_STABLE_DURATION = 1.0  # 秒
+
+# 稳定窗口内允许的最大角度极差：max(samples) - min(samples)。
+POSITION_STABLE_ANGLE_SPAN = 0.5  # 度
+
+# 状态轮询间隔；回零和普通移动默认共用，调用方仍可按需覆盖。
+POSITION_POLL_INTERVAL = 0.5  # 秒
+
+# 回零正常等待时间；超过后不立即失败，若已进入稳定候选则继续观察。
+HOME_NORMAL_TIMEOUT = 10.0  # 秒
+
+# 回零单次尝试的绝对截止时间；包括跨过正常超时后的稳定观察时间。
+HOME_HARD_TIMEOUT = 15.0  # 秒
+
+# 普通移动正常等待时间和绝对截止时间。
+MOVE_NORMAL_TIMEOUT = 4.0  # 秒
+MOVE_HARD_TIMEOUT = 8.0  # 秒
+
+# 厂商恢复流程的最大执行次数。为避免反复撞击或持续堵转，默认只恢复一次。
+HOME_RECOVERY_MAX_ATTEMPTS = 1
+
+# 厂商“上电找 0”指令后的静默等待时间，再执行“点击回 0”。
+POWER_ON_HOMING_WAIT = 10.0  # 秒
 ```
 
-该值与 `main.py` 中已有的 `ANGLE_VERIFY_TOLERANCE = 5.0` 语义一致，用于同一类"角度偏差可接受"的判断场景。
-
-#### 10.3.2 修改 `_wait_until_stopped`
-
-新增可选参数 `expected_angle` 和 `angle_tolerance`：
+不增加速度阈值或速度计算。稳定性只由以下两个条件确定：
 
 ```python
-def _wait_until_stopped(self, timeout_s=10.0, interval_s=0.5,
-                        expected_angle=None, angle_tolerance=None):
+sample_duration >= POSITION_STABLE_DURATION
+max(sample_angles) - min(sample_angles) <= POSITION_STABLE_ANGLE_SPAN
 ```
 
-当检测到边界状态 (`0x0B`/`0xF5`) 时，增加容差判断：
+### 10.4 `_wait_until_stopped()` 双策略到位判定
+
+`_wait_until_stopped()` 继续作为唯一状态等待入口。内部按 `wait_policy` 分为两个明确分支：
 
 ```python
-if status in (0x0B, 0xF5):
-    boundary_name = "零点边界" if status == 0xF5 else "远端边界"
-    print(f"⚠️ [{self.port}] 电机触碰物理{boundary_name}。状态={status}, 内部角度={real_angle}°")
-
-    if expected_angle is not None and real_angle is not None and angle_tolerance is not None:
-        if abs(real_angle - expected_angle) <= angle_tolerance:
-            print(f"✅ [{self.port}] 碰壁但内部角度在容差内 "
-                  f"(实测={real_angle:.2f}°, 期望={expected_angle:.2f}°, "
-                  f"偏差={abs(real_angle - expected_angle):.2f}° <= {angle_tolerance}°)，视为到位。")
-            return True, status, real_angle
-
-    return False, status, real_angle
-```
-
-#### 10.3.3 修改 `return_to_home`
-
-在调用 `_wait_until_stopped` 时传入期望角度 0.0 和容差：
-
-```python
-def return_to_home(self):
+if wait_policy == "legacy":
+    # 保留当前实现的判断顺序、日志、等待和三元组返回值。
     ...
-    self.send_command(LENS_RETURN_HOME_COMMAND, wait_time=0.5)
 
-    stopped, status, real_angle = self._wait_until_stopped(
-        timeout_s=10.0, interval_s=0.5,
-        expected_angle=0.0, angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
-    )
-    if not stopped:
-        print(f"❌ [{self.port}] 回 0 超时或异常！...")
-        return False
-
-    # 软件坐标模式：即使碰壁被容差通过，仍用实测角度校准 current_angle
-    if self.coordinate_mode == COORDINATE_MODE_SOFTWARE:
-        self._log_home_internal_angle(real_angle)
-        if real_angle is not None:
-            self.current_angle = real_angle  # 用实测值修正，不再无条件设 0.0
-            print(f"🎉 [{self.port}] 寻零完成，软件坐标已校准为 {real_angle:.2f}°。")
-        else:
-            self._set_software_zero()
-            print(f"🎉 [{self.port}] 寻零完成，软件坐标已设置为 0.0°。")
-        return True
-    ...
+# wait_policy == "full_shot"
+# 执行下述增强到位判定，仍返回相同三元组。
 ```
 
-关键变化：软件坐标模式下不再无条件 `current_angle = 0.0`，而是优先采用实测 `real_angle`，这样当碰壁容差通过时（如 `real_angle = -2.5°`），后续阵位的 `delta_angle = target - (-2.5)` 能够正确算出正向位移，驱动镜头离开边界。
+实施时可以将原代码提取到私有辅助函数以减少嵌套，但这只是机械重排，legacy 分支的可观察行为必须保持一致。不得让 full-shot 的稳定推断或硬超时规则泄漏到默认分支。
 
-#### 10.3.4 修改 `move_to_absolute_angle`
+#### 10.4.1 输入参数
 
-在调用 `_wait_until_stopped` 时传入目标角度和容差：
+full-shot 调用共享方法时显式传入以下参数：
 
 ```python
-def move_to_absolute_angle(self, target_angle_deg, speed_rpm=LENS_SPEED_RPM):
-    ...
-    stopped, status, real_angle = self._wait_until_stopped(
-        timeout_s=4.0, interval_s=0.2,
-        expected_angle=target_angle_deg, angle_tolerance=BOUNDARY_ANGLE_TOLERANCE,
-    )
-    if not stopped:
-        print(f"❌ 主动查验超时或异常！...")
-        return False
-
-    if self.coordinate_mode == COORDINATE_MODE_SOFTWARE:
-        # 软件坐标模式：用实测值或目标值更新坐标
-        if real_angle is not None:
-            self.current_angle = real_angle
-            print(f"✅ 电机停稳。内部角度={real_angle:.2f}°，软件坐标已校准。")
-        else:
-            self.current_angle = target_angle_deg
-            print(f"✅ 电机停稳。软件坐标更新为 {target_angle_deg:.2f}°")
-        return True
-    ...
+stopped, status, real_angle = self._wait_until_stopped(
+    expected_angle=target_angle,
+    angle_tolerance=target_tolerance,
+    operation="home",  # 或 "absolute_move"
+    wait_policy="full_shot",
+    normal_timeout_s=normal_timeout,
+    hard_timeout_s=hard_timeout,
+    interval_s=POSITION_POLL_INTERVAL,
+)
 ```
 
-#### 10.3.5 `move_relative_for_calibration` —— 无需修改
+其中：
 
-该函数仅在 `focus_calibration` 交互式标定中使用。其内部逻辑为：
+- `operation` 只需区分 `home` 和 `absolute_move`，不接收 `calibration_move`；
+- `expected_angle` 和 `angle_tolerance` 用于统一验证实测位置；
+- `normal_timeout_s` 表示普通状态等待期限；
+- `hard_timeout_s` 是本次调用不可突破的绝对截止时间。
+
+#### 10.4.2 两阶段时间策略
+
+稳定判断不会先等待到正常超时才开始，而是在任意一次轮询进入目标容差时立即开始收集候选样本：
+
+1. 在正常等待时间内，如果返回明确终态并且角度符合目标，立即成功。
+2. 当 `0x01` 或 `0xFF` 的实测角度进入目标容差时，立即建立稳定候选窗口。
+3. 候选角度离开目标容差，或者稳定窗口极差超限时，清空候选并继续等待。
+4. 候选样本覆盖 `POSITION_STABLE_DURATION` 且角度极差不超限时，返回“推断到位”。
+5. 如果候选窗口跨过 `normal_timeout_s`，允许继续完成稳定观察，但不得超过 `hard_timeout_s`。
+6. 达到 `hard_timeout_s` 仍无法确认到位，返回故障，不无限等待 `0xF5`。
+
+该策略可以处理“第 6 秒进入目标范围、第 7.5 秒稳定成功”，也可以处理“第 9.8 秒才进入目标范围、跨过 10 秒继续观察”，同时保证最迟在硬超时截止。
+
+#### 10.4.3 结构化返回值
+
+为兼容所有既有调用，函数仍返回 `(stopped, status, real_angle)`。仅在 `wait_policy="full_shot"` 时，额外把统一诊断字典写入 `self.full_shot_last_wait_result`：
 
 ```python
-stopped, status, real_angle = self._wait_until_stopped(...)
-boundary = status in LENS_BOUNDARY_STATUSES
-
-if boundary:                    # ← 第一个判断分支
-    return {"ok": True, "boundary": True, ...}
+{
+    "ok": True,
+    "reason": "inferred_stable_at_target",
+    "operation": "home",
+    "status": 0xFF,
+    "real_angle": -2.65,
+    "expected_angle": 0.0,
+    "deviation": 2.65,
+    "position_quality": "inferred",
+    "stable_duration": 1.6,
+    "stable_span": 0.08,
+    "elapsed": 8.2,
+    "boundary": "zero",
+}
 ```
 
-由于 `boundary` 判断位于最前面，无论 `_wait_until_stopped` 返回 `stopped=True` 还是 `False`，只要 `status == 0xF5` 或 `0x0B`，就会进入边界分支，返回结构 `{"ok": True, "boundary": True}` 完全不变。上游 `classify_calibration_move` 的 `result.get("boundary")` 行为不受影响，且 `focus_calibration` 流程自身已有 `classify_calibration_move` 做交互级边界容差处理。**因此该函数不需要任何修改。**
+`reason` 至少覆盖：
 
-### 10.4 影响分析
+- `confirmed_stopped_at_target`
+- `confirmed_zero_boundary`
+- `confirmed_far_boundary`
+- `inferred_stable_at_target`
+- `stopped_position_mismatch`
+- `boundary_position_mismatch`
+- `timeout_still_moving`
+- `timeout_unstable_at_target`
+- `serial_read_failed`
+- `unexpected_status`
 
-#### 正向影响
+### 10.5 软件坐标状态模型
 
-- **回零碰壁自动恢复**：`real_angle ≈ -2.5°` 在 5° 容差内，视为成功。`current_angle` 更新为实测值，后续阵位的 `delta_angle` 计算正确，镜头能正常驱动离开边界。
-- **静默故障变为可见**：即使容差通过，日志也会输出 `碰壁但内部角度在容差内`，方便事后排查。
-- **正常移动碰壁同样受益**：`move_to_absolute_angle` 也加入了容差，即使非回零场景下轻微碰壁也能容错。
+在 `LensController` 中增加以下状态。这些字段只在 `wait_policy="full_shot"` 时读取和更新，不改变 `focus_calibration` 当前依赖的 `current_angle` 更新规则：
 
-#### 风险
+```python
+self.current_angle = 0.0            # 兼容现有逻辑，保留
+self.last_measured_angle = None
+self.full_shot_position_valid = False
+self.full_shot_position_quality = "unknown"
+self.full_shot_last_wait_result = None
+self.full_shot_last_motion_result = None
+```
 
-- **容差过大可能掩盖真正的硬件故障**：5° 对应约 455 个编码器脉冲（32768 分辨率下），如果镜头实际卡在非零点位置，容差可能将其误判为正常。但鉴于 `ANGLE_VERIFY_TOLERANCE` 在标定流程中已使用相同的 5° 阈值，该值属于经过实践检验的合理范围。
+字段含义：
 
-### 10.5 预计影响文件
+- `current_angle`：只有在位置可信时才可用于下一次相对位移计算；
+- `last_measured_angle`：最后一次读取到的真实角度，即使失败也保留用于日志和诊断；
+- `full_shot_position_valid`：当前软件坐标是否允许被 full-shot 作为运动基准；
+- `full_shot_position_quality`：`confirmed`、`inferred` 或 `unknown`；
+- `full_shot_last_wait_result`：共享等待函数最近一次 full-shot 分支的详细诊断结果；
+- `full_shot_last_motion_result`：full-shot 最近一次回零或移动的完整结构化结果，供上层决策和日志输出。
+
+采用 `full_shot_` 前缀是为了避免标定模式无意依赖新增状态。`focus_calibration` 仍按当前逻辑读取和更新 `current_angle`，不检查这些新字段。
+
+更新规则：
+
+1. `0x00`/合理边界状态确认到位：使用实测角度更新 `current_angle`，设置 `full_shot_position_valid=True`、`full_shot_position_quality="confirmed"`。
+2. `0x01`/`0xFF` 在目标附近连续稳定：使用稳定窗口最后值或平均值更新 `current_angle`，设置 `full_shot_position_valid=True`、`full_shot_position_quality="inferred"`。
+3. 超时但存在真实角度：只更新 `last_measured_angle`。如果最后一段角度已经满足完整稳定条件，应归入第 2 类；否则不能把不断变化的角度作为可信基准，设置 `full_shot_position_valid=False`、`full_shot_position_quality="unknown"`。
+4. 串口读取失败或没有真实角度：保持最后测量记录，设置 `full_shot_position_valid=False`。
+5. 禁止在失败后继续保留旧的有效坐标状态。
+
+`move_to_absolute_angle(..., wait_policy="full_shot")` 的小位移快捷返回必须增加有效性约束；legacy 分支继续保留原行为：
+
+```python
+if self.full_shot_position_valid and abs(delta_angle) < 0.1:
+    # 跳过前再读取并核对一次真实角度；只有仍在 MOVE_ANGLE_TOLERANCE 内才成功。
+```
+
+如果 `full_shot_position_valid=False`，则必须先读取并稳定确认真实位置；无法确认时返回当前相机移动失败，不能使用旧的 `current_angle` 跳过指令。该约束不加入原 `move_relative_for_calibration()`。
+
+### 10.6 回零专用恢复策略
+
+厂商建议的“上电找 0 → 点击回 0”只应用于 `return_to_home(wait_policy="full_shot")`，不应用于普通绝对角度移动、系统初始化或 `focus_calibration` 默认调用的 `return_to_home()`，也不在 `_wait_until_stopped()` 内自动触发。等待函数只负责观测和分类，恢复动作由 `return_to_home()` 的 full-shot 策略分支编排。
+
+回零流程分为两个阶段：
+
+#### 第一阶段：正常点击回 0
+
+1. 下发 `LENS_RETURN_HOME_COMMAND`。
+2. 使用 `HOME_NORMAL_TIMEOUT`、`HOME_HARD_TIMEOUT`、`HOME_ANGLE_TOLERANCE` 等待。
+3. 如果得到明确成功或 `0xFF` 零点附近连续稳定，则同步实测坐标并返回成功。
+
+#### 第二阶段：厂商恢复流程
+
+仅当第一阶段最终失败时执行，默认最多一次：
+
+1. 记录第一次失败的完整结果。
+2. 输出醒目的恢复日志，说明即将执行厂商恢复方案。
+3. 下发 `LENS_POWER_ON_HOMING_COMMAND`。
+4. 静默等待 `POWER_ON_HOMING_WAIT`，供硬件完成找零标定。
+5. 下发 `LENS_RETURN_HOME_COMMAND`。
+6. 再次使用完整的回零到位判定等待结果。
+7. 第二次成功：同步实测角度，将结果标记为 `recovered=True`，继续参与后续拍摄。
+8. 第二次仍失败：将该镜头标记为隔离，不再反复执行恢复指令。
+
+恢复期间同样受硬超时约束。`Ctrl+C` 必须能够正常传播，不能被宽泛的 `except Exception` 吞掉。
+
+### 10.7 单相机隔离与持续运行策略
+
+本项目默认采用“持续运行优先”策略。单个镜头最终失败不主动中断整段 `full_shot`，而是隔离对应相机；其他相机继续移动和拍摄。用户如需停止整段任务，可使用 `Ctrl+C`。
+
+在 `ImagingNode` 中增加运行状态，例如：
+
+```python
+self.enabled = True
+self.failure_reason = None
+self.failed_at_position = None
+self.failed_at_step = None
+```
+
+隔离规则：
+
+1. 普通角度移动经过判定仍失败：立即隔离该相机，本阵位不触发该相机拍照，后续阵位也跳过其镜头移动和拍照。
+2. 阵位拍摄结束后的回零经过厂商恢复仍失败：隔离该相机，从下一阵位开始跳过；已经成功保存的历史图片保留。
+3. 相机拍照本身失败或抛出异常：记录并隔离该相机，其他相机继续。
+4. 隔离不关闭整个系统、不终止转台循环，也不自动重试无上限次数。
+5. 任务结束时输出隔离相机汇总，明确哪些阵位缺图或可能存在焦距风险。
+
+需要特别区分回零结果：
+
+- `0xFF + 零点附近连续稳定` 属于可继续运行的“推断成功”，不隔离相机，但输出警告级日志；
+- 第一次回零失败、厂商恢复成功属于“恢复成功”，不隔离相机；
+- 厂商恢复后仍无法确认到位，才执行隔离。
+
+### 10.8 并发结果传播与拍照过滤
+
+`parallel_move_lenses()`、`parallel_move_lenses_by_camera()`、`parallel_snap_rotation_step()` 不能只调用 `concurrent.futures.wait()` 后无条件输出成功。必须逐个调用 `future.result()`，收集相机名、串口和结构化结果，并返回汇总：
+
+```python
+{
+    "ok": False,
+    "successful": ["1", "3", "4"],
+    "failed": {
+        "2": {
+            "port": "COM9",
+            "reason": "home_recovery_failed",
+            "status": 0xFF,
+            "real_angle": -2.65,
+        }
+    },
+}
+```
+
+上层行为：
+
+1. 移动成功的相机进入本阵位拍照集合。
+2. 移动失败或已隔离的相机不拍照，避免生成焦距错误但文件名正常的误导性图片。
+3. 其余相机正常拍照，转台流程继续。
+4. “所有镜头均已同步到位”只能在全部活动镜头成功时输出。
+5. 存在失败时输出“部分镜头到位，已隔离 N 台，其余继续”，不能再输出全成功文案。
+6. 每个 step 的 metadata 增加活动相机、跳过相机、各镜头移动结果、位置质量和隔离原因，便于后续识别缺图及异常图。
+
+### 10.9 日志规范
+
+每次移动或回零至少记录：
+
+- 相机名和串口；
+- 操作类型、尝试序号、是否属于厂商恢复；
+- 目标角度、软件起始角度、软件坐标是否有效、坐标质量；
+- 原始状态码的十六进制与十进制形式；
+- 实测角度、目标偏差；
+- 稳定候选开始/取消原因、样本数、覆盖时间、角度极差；
+- 正常超时和硬超时各自是否到达；
+- 最终 `reason`、是否推断成功、是否恢复成功、是否隔离。
+
+建议关键日志示例：
+
+```text
+⚠️ [相机2/COM9] 回零状态仍为 0xFF (255)，实测=-2.65°，偏差=2.65°；进入稳定候选。
+✅ [相机2/COM9] 连续稳定 1.60s，角度极差=0.08°；推断已回到零点，position_quality=inferred。
+⚠️ [相机2/COM9] 首次回零失败 reason=timeout_unstable_at_target；执行厂商恢复 1/1：上电找0 → 点击回0。
+✅ [相机2/COM9] 厂商恢复成功，实测=-0.03°，status=0x00 (0)。
+❌ [相机2/COM9] 厂商恢复后仍无法确认到位，reason=timeout_still_moving；已隔离该相机，其余相机继续。
+```
+
+轮询日志需要限频或仅在状态变化、候选状态变化、固定时间间隔时输出，避免每 0.2 秒刷屏，但内部结果应保留最后状态和关键统计值。
+
+### 10.10 预计影响文件
 
 - `LensController.py`
-  - 新增 `BOUNDARY_ANGLE_TOLERANCE` 常量。
-  - `_wait_until_stopped` 新增 `expected_angle` 和 `angle_tolerance` 可选参数及容差判断逻辑。
-  - `return_to_home`：传入容差参数；软件坐标模式改用 `real_angle` 校准 `current_angle`。
-  - `move_to_absolute_angle`：传入容差参数；软件坐标模式改用 `real_angle` 校准 `current_angle`。
-  - `move_relative_for_calibration`：无需修改（其 `boundary` 分支在最前，不受 `_wait_until_stopped` 返回值变化影响）。
+  - 在顶部集中增加全部可调阈值及注释。
+  - `_wait_until_stopped()` 增加默认值为 `legacy` 的策略参数；legacy 分支保持原逻辑和三元组返回值，full-shot 分支增加稳定判定和详细结果。
+  - `initialize_lens()` 和 `move_relative_for_calibration()` 的代码及调用方式保持不变。
+  - `return_to_home()`、`move_to_absolute_angle()` 增加默认值为 `legacy` 的可选策略参数，默认调用行为不变。
+  - 增加带 `full_shot_` 前缀的软件坐标有效性、质量、等待结果和操作结果字段。
+  - `return_to_home()` 的 full-shot 分支编排首次回零和一次厂商恢复流程。
+  - `move_to_absolute_angle()` 的 full-shot 分支使用普通移动容差和稳定判定，并修复无效坐标下的小位移跳过。
+
+- `ImageNode.py`
+  - 为 `ImagingNode` 增加启用/隔离状态和失败上下文。
+  - `parallel_global_homing()` 收集每台镜头的初始化结果；成功时只在上层初始化 full-shot 坐标质量状态，失败时隔离对应相机，不修改 `initialize_lens()`。
+  - full-shot 并发移动显式调用 `move_to_absolute_angle(..., wait_policy="full_shot")`；目标为 0 时该方法继续把策略传给共享 `return_to_home()`。
+  - 所有并发移动与拍摄函数读取 `future.result()`、返回汇总并过滤隔离相机。
+  - 日志中同时带相机名和串口。
 
 - `main.py`
-  - 无需修改。`full_shot` 调用方 (`parallel_move_lenses` 等) 不感知内部容差逻辑。
+  - `full_shot` 根据移动汇总只拍摄成功相机，不因单相机失败终止整个循环。
+  - 回零失败恢复后隔离对应相机，其余相机和转台继续。
+  - step metadata 记录镜头状态、跳过原因和位置质量。
+  - 保持 `KeyboardInterrupt` 可由用户主动中止整段任务。
 
-### 10.6 验证计划
+- 测试文件
+  - 增加无硬件的状态序列测试、稳定窗口测试、厂商恢复测试、隔离与并发汇总测试。
 
-1. **正常回零不受影响**：`status == 0x00` 时，容差分支不触发，行为与改造前完全一致。
-2. **碰壁容差通过**：模拟或实际触发 `status == 0xF5, real_angle = -2.5°`，验证 `return_to_home` 返回 `True`，`current_angle` 更新为 `-2.5°`，控制台输出 `碰壁但内部角度在容差内`。
-3. **碰壁容差不通过**：模拟 `real_angle = -10°`（超出 5° 容差），验证 `return_to_home` 返回 `False`，行为与改造前一致。
-4. **后续阵位正常驱动**：容差通过后，下一个阵位的 `move_to_absolute_angle(2000°)` 计算 `delta = 2000 - (-2.5) = 2002.5°`，正确下发正向移动指令，镜头离开边界。
-5. **焦距标定兼容**：执行 `focus_calibration` 流程的交互式标定，验证边界碰壁提示和容差行为无退化。
-6. **远端边界不受影响**：`status == 0x0B` 远端边界时，如果 `real_angle` 在容差范围内，同样可通过容差检查；超出容差则保持原有失败行为。
+### 10.11 验证计划
 
-### 10.7 实施顺序
+1. **正常移动**：`0x01 → 0x00`，最终角度在目标容差内，返回 `confirmed`。
+2. **正常回零**：`0xFF → 0x00`，零点角度符合容差，不触发厂商恢复。
+3. **明确零点边界**：`0xF5/-2.5°`，回零确认成功并用实测角度校准软件坐标。
+4. **0xFF 稳定推断**：连续 `0xFF`，角度在零点附近且覆盖稳定时间、极差不超限，返回 `inferred`，不触发恢复、不隔离。
+5. **0xFF 仍在变化**：角度虽在零点容差内但极差持续超限，不能推断成功；达到硬超时后进入厂商恢复。
+6. **候选跨正常超时**：在正常超时前刚进入容差，允许跨过正常超时完成稳定观察，但不能越过硬超时。
+7. **停稳但位置错误**：`0x00` 但角度超出目标容差，返回 `stopped_position_mismatch`，不能误判成功。
+8. **边界方向错误**：回零时读到 `0x0B`，不得按零点成功处理。
+9. **普通移动稳定推断**：`0xFF` 在普通目标附近连续稳定，按 `MOVE_ANGLE_TOLERANCE` 返回 `inferred`。
+10. **厂商恢复成功**：首次回零失败，执行一次“上电找 0 → 点击回 0”后成功，不隔离相机。
+11. **厂商恢复失败**：第二次仍失败，只隔离故障相机，其余相机继续后续阵位。
+12. **软件坐标失效**：失败后 `full_shot_position_valid=False`，即使旧 `current_angle` 与下一目标之差小于 `0.1°`，也不得快捷返回。
+13. **并发部分失败**：四台相机中一台失败，另外三台仍移动和拍照；失败相机不生成本阵位图片，并写入 metadata。
+14. **拍照失败隔离**：某相机拍照抛异常后被隔离，其余相机和转台继续。
+15. **用户中断**：任意等待或恢复阶段按 `Ctrl+C`，`KeyboardInterrupt` 正常向上传播并执行既有资源清理。
+16. **焦距标定零改动兼容**：确认 `focus_calibration` 中 `initialize_lens()`、`return_to_home()`、`move_relative_for_calibration()` 和 `_wait_until_stopped()` 的调用代码段不增加新参数；现有返回结构、边界识别、交互输出和配置结果不变。
+17. **策略隔离检查**：通过静态搜索或单元测试确认只有 ImageNode 的 full-shot 移动路径传入 `wait_policy="full_shot"`，`calibrate_single_lens()` 及其调用链始终使用默认 legacy 策略且不读取 `full_shot_*` 状态字段。
+18. **初始化隔离检查**：full-shot 初始化成功后由 `ImageNode` 上层建立专用坐标状态；初始化失败只隔离对应相机；`initialize_lens()` 本身代码和 focus_calibration 行为不变。
 
-1. 在 `LensController.py` 新增 `BOUNDARY_ANGLE_TOLERANCE` 常量。
-2. 修改 `_wait_until_stopped`，增加 `expected_angle`/`angle_tolerance` 可选参数和容差判断。
-3. 修改 `return_to_home`，传入容差参数并改用 `real_angle` 校准软件坐标。
-4. 修改 `move_to_absolute_angle`，传入容差参数并优先使用 `real_angle` 更新坐标。
-5. 确认 `move_relative_for_calibration` 无需修改（其 `boundary` 判断路径不受影响）。
-6. 硬件联调验证：正常回零、碰壁容差通过、碰壁容差不通过、后续阵位驱动恢复、标定兼容。
+### 10.12 实施顺序
+
+1. 在 `LensController.py` 顶部增加全部可调阈值和说明。
+2. 为 `_wait_until_stopped()` 增加默认 legacy 策略，并用回归测试锁定原行为和三元组返回值。
+3. 定义 full-shot 诊断结果结构和带前缀的软件坐标质量状态。
+4. 在 `_wait_until_stopped()` 的 full-shot 分支实现目标误差、连续角度稳定、正常超时和硬超时。
+5. 为 `move_to_absolute_angle()` 增加可选策略参数，仅在 full-shot 分支修复无效坐标的小位移快捷返回。
+6. 为 `return_to_home()` 增加可选策略参数，仅在 full-shot 分支接入首次回零及一次厂商恢复流程。
+7. 修改 `ImageNode.py`，让 full-shot 显式传入增强策略，并实现并发结果传播、相机隔离和拍照过滤。
+8. 修改 `main.py`，实现持续运行策略、metadata 异常记录和最终汇总。
+9. 增加 mock 状态序列测试，覆盖 10.11 中全部非硬件场景和接口隔离检查。
+10. 回归执行现有 `focus_calibration`，确认交互和标定结果零行为变化。
+11. 使用真实镜头调节顶部阈值，验证 `0xFF` 稳定、`0xF5` 边界、厂商恢复以及单相机隔离行为。
