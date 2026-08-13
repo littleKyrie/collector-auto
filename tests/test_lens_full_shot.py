@@ -319,5 +319,124 @@ class FullShotRecoveryTests(unittest.TestCase):
         self.assertTrue(kwargs["target_clamped"])
 
 
+class FullShotInitializationTests(unittest.TestCase):
+    def make_open_lens(self):
+        lens = LensController("TEST")
+        lens.serial = mock.Mock(is_open=True)
+        return lens
+
+    def test_legacy_initialize_remains_default(self):
+        lens = self.make_open_lens()
+        with mock.patch.object(lens, "send_command", return_value=True), mock.patch.object(
+            lens, "_wait_until_stopped", return_value=(True, 0x00, 0.0)
+        ) as wait, mock.patch.object(
+            lens_module.time, "sleep", return_value=None
+        ), contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.initialize_lens()
+
+        self.assertTrue(ok)
+        self.assertNotIn("wait_policy", wait.call_args.kwargs)
+        self.assertIsNone(lens.full_shot_last_motion_result)
+
+    def test_full_shot_initialize_succeeds_without_using_recovery_budget(self):
+        lens = self.make_open_lens()
+        home_result = {
+            "ok": True,
+            "reason": "inferred_stable_at_target",
+            "operation": "home",
+            "status": 0xFF,
+            "real_angle": -2.12,
+            "position_quality": "inferred",
+        }
+        with mock.patch.object(lens, "send_command", return_value=True), mock.patch.object(
+            lens, "_execute_home_once", return_value=home_result
+        ), mock.patch.object(
+            lens_module.time, "sleep", return_value=None
+        ), contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.initialize_lens(wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertTrue(ok)
+        self.assertEqual(lens.full_shot_last_motion_result["reason"], "initialized")
+        self.assertEqual(lens.full_shot_last_motion_result["recovery_attempts_used"], 0)
+        self.assertEqual(lens.full_shot_position_quality, "inferred")
+        self.assertAlmostEqual(lens.current_angle, -2.12)
+
+    def test_full_shot_initialize_recovers_after_initial_failure(self):
+        lens = self.make_open_lens()
+        initial_failure = {
+            "ok": False,
+            "reason": "timeout_still_moving",
+            "operation": "home",
+            "status": 0xFF,
+            "real_angle": -8.0,
+        }
+        recovered_home = {
+            "ok": True,
+            "reason": "confirmed_stopped_at_target",
+            "operation": "home",
+            "status": 0x00,
+            "real_angle": 0.1,
+            "position_quality": "confirmed",
+        }
+        with mock.patch.object(lens, "send_command", return_value=True), mock.patch.object(
+            lens, "_execute_home_once", return_value=initial_failure
+        ), mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            return_value={
+                "ok": True,
+                "reason": "coordinate_rebuild_succeeded",
+                "home": recovered_home,
+            },
+        ) as rebuild, mock.patch.object(
+            lens_module.time, "sleep", return_value=None
+        ), contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.initialize_lens(wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertTrue(ok)
+        rebuild.assert_called_once_with(1)
+        self.assertEqual(
+            lens.full_shot_last_motion_result["reason"],
+            "initialized_after_recovery",
+        )
+        self.assertEqual(lens.full_shot_last_motion_result["recovery_attempts_used"], 1)
+        self.assertTrue(lens.full_shot_position_valid)
+
+    def test_full_shot_initialize_isolatable_after_recovery_exhausted(self):
+        lens = self.make_open_lens()
+        initial_failure = {
+            "ok": False,
+            "reason": "timeout_still_moving",
+            "operation": "home",
+            "status": 0xFF,
+            "real_angle": -8.0,
+        }
+        with mock.patch.object(lens, "send_command", return_value=True), mock.patch.object(
+            lens, "_execute_home_once", return_value=initial_failure
+        ), mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            side_effect=[
+                {"ok": False, "reason": "recovery_home_failed", "home": {"ok": False}},
+                {"ok": False, "reason": "recovery_home_failed", "home": {"ok": False}},
+            ],
+        ) as rebuild, mock.patch.object(
+            lens_module.time, "sleep", return_value=None
+        ), contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.initialize_lens(wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertFalse(ok)
+        self.assertEqual(rebuild.call_count, lens_module.HOME_RECOVERY_MAX_ATTEMPTS)
+        self.assertEqual(
+            lens.full_shot_last_motion_result["reason"],
+            "initialization_recovery_exhausted",
+        )
+        self.assertEqual(
+            lens.full_shot_last_motion_result["recovery_attempts_used"],
+            lens_module.HOME_RECOVERY_MAX_ATTEMPTS,
+        )
+        self.assertFalse(lens.full_shot_position_valid)
+
+
 if __name__ == "__main__":
     unittest.main()

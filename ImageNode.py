@@ -126,7 +126,10 @@ class ImagingSystem:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes_with_lens)) as executor:
             futures = {
-                executor.submit(node.lens.initialize_lens): node
+                executor.submit(
+                    node.lens.initialize_lens,
+                    wait_policy=WAIT_POLICY_FULL_SHOT,
+                ): node
                 for node in nodes_with_lens
             }
             successful = []
@@ -142,9 +145,11 @@ class ImagingSystem:
                     reason = "initialize_failed"
 
                 if ok:
-                    node.lens.mark_full_shot_initialized()
                     successful.append(cam_name)
                 else:
+                    reason = (node.lens.full_shot_last_motion_result or {}).get(
+                        "reason", reason
+                    )
                     node.isolate(reason)
                     failed[cam_name] = node.status_summary()
 

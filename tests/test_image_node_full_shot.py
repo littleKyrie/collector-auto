@@ -43,6 +43,11 @@ class FakeLens:
             "reason": "confirmed_stopped_at_target" if move_ok else reason,
         }
         self.calls = []
+        self.initialize_calls = []
+
+    def initialize_lens(self, **kwargs):
+        self.initialize_calls.append(kwargs)
+        return self.move_ok
 
     def move_to_absolute_angle(self, target, **kwargs):
         self.calls.append((target, kwargs))
@@ -116,6 +121,30 @@ class ImagingSystemIsolationTests(unittest.TestCase):
             self.assertEqual(isolated.camera.capture_calls, [])
             self.assertTrue(os.path.isdir(os.path.join(temp_dir, "1")))
             self.assertFalse(os.path.exists(os.path.join(temp_dir, "2")))
+
+    def test_parallel_global_homing_uses_full_shot_policy(self):
+        healthy = FakeNode("1", "COM7", move_ok=True)
+        failed = FakeNode("2", "COM9", move_ok=False)
+        failed.lens.full_shot_last_motion_result = {
+            "ok": False,
+            "reason": "initialization_recovery_exhausted",
+        }
+        system = self.make_system([healthy, failed])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = system.parallel_global_homing()
+
+        self.assertEqual(
+            healthy.lens.initialize_calls[0]["wait_policy"],
+            image_node_module.WAIT_POLICY_FULL_SHOT,
+        )
+        self.assertEqual(
+            failed.lens.initialize_calls[0]["wait_policy"],
+            image_node_module.WAIT_POLICY_FULL_SHOT,
+        )
+        self.assertIn("1", summary["successful"])
+        self.assertIn("2", summary["failed"])
+        self.assertEqual(failed.failure_reason, "initialization_recovery_exhausted")
 
 
 if __name__ == "__main__":

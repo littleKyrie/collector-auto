@@ -543,7 +543,14 @@ class LensController:
         self.full_shot_position_valid = False
         self.full_shot_position_quality = "unknown"
 
-    def initialize_lens(self):
+    def initialize_lens(self, wait_policy=WAIT_POLICY_LEGACY):
+        """初始化镜头坐标系；默认 legacy，full_shot 显式启用增强保障。"""
+        if wait_policy not in VALID_WAIT_POLICIES:
+            raise ValueError(f"Unsupported wait policy: {wait_policy}")
+        if wait_policy == WAIT_POLICY_FULL_SHOT:
+            return self._initialize_lens_for_full_shot()
+
+        # legacy 分支由 focus_calibration 等既有调用使用，保持原有执行顺序。
         if not self.serial or not self.serial.is_open:
             print(f"❌ [{self.port}] 严重错误: 串口未打开！")
             return False
@@ -592,6 +599,165 @@ class LensController:
 
         print(f"❌ [{self.port}] 硬件坐标模式归零失败！状态={status}, 内部角度={real_angle}°")
         return False
+
+    def _initialize_lens_for_full_shot(self):
+        """为 full_shot 建立坐标系，并为本次初始化提供独立恢复预算。"""
+        if not self.serial or not self.serial.is_open:
+            self._invalidate_full_shot_position()
+            self.full_shot_last_motion_result = {
+                "ok": False,
+                "reason": "serial_not_open",
+                "operation": "initialize",
+                "recovered": False,
+                "recovery_attempts_used": 0,
+                "recovery_history": [],
+            }
+            print(f"❌ [{self._device_label()}] 严重错误: 镜头串口未打开！")
+            return False
+
+        print(f"🔄 [{self._device_label()}] full_shot 初始化：正在配置串口静默...")
+        if not self.send_command(LENS_SILENT_COMMAND, wait_time=0.1):
+            return self._finish_full_shot_initialization_command_failure(
+                "silent_command_failed"
+            )
+        if not self.send_command(LENS_CONFIG_COMMAND, wait_time=0.1):
+            return self._finish_full_shot_initialization_command_failure(
+                "config_command_failed"
+            )
+
+        print(
+            f"📍 [{self._device_label()}] full_shot 初始化："
+            f"正在执行首次【上电找0 → 点击回0】（不计入恢复次数）。"
+        )
+        if not self.send_command(LENS_POWER_ON_HOMING_COMMAND, wait_time=0.5):
+            return self._finish_full_shot_initialization_command_failure(
+                "power_on_homing_command_failed"
+            )
+        print(
+            f"⏳ [{self._device_label()}] 等待 {POWER_ON_HOMING_WAIT:.2f}s，"
+            f"供首次上电找0完成。"
+        )
+        time.sleep(POWER_ON_HOMING_WAIT)
+
+        initial_result = self._execute_home_once()
+        if initial_result.get("ok"):
+            return self._finish_full_shot_initialization_success(
+                initial_result=initial_result,
+                recovery_history=[],
+                recovery_attempts_used=0,
+            )
+
+        self._invalidate_full_shot_position(initial_result.get("real_angle"))
+        if not self._full_shot_failure_is_recoverable(initial_result.get("reason")):
+            final_result = dict(initial_result)
+            final_result.update({
+                "ok": False,
+                "operation": "initialize",
+                "recovered": False,
+                "recovery_attempts_used": 0,
+                "initial_failure": initial_result,
+                "recovery_history": [],
+            })
+            self.full_shot_last_motion_result = final_result
+            print(
+                f"❌ [{self._device_label()}] full_shot 初始化发生不可恢复错误: "
+                f"reason={initial_result.get('reason')}。"
+            )
+            return False
+
+        recovery_history = []
+        for attempt_number in range(1, HOME_RECOVERY_MAX_ATTEMPTS + 1):
+            rebuild_result = self._rebuild_coordinate_system_once(attempt_number)
+            history_item = {
+                "attempt": attempt_number,
+                "home": rebuild_result.get("home"),
+                "replay": None,
+                "ok": bool(rebuild_result.get("ok")),
+                "reason": rebuild_result.get("reason"),
+            }
+            recovery_history.append(history_item)
+            if rebuild_result.get("ok"):
+                return self._finish_full_shot_initialization_success(
+                    initial_result=initial_result,
+                    recovery_history=recovery_history,
+                    recovery_attempts_used=attempt_number,
+                )
+            if rebuild_result.get("reason") in {
+                "power_on_homing_command_failed",
+                "return_home_command_failed",
+            }:
+                break
+
+        self._invalidate_full_shot_position()
+        self.full_shot_last_motion_result = {
+            "ok": False,
+            "reason": "initialization_recovery_exhausted",
+            "operation": "initialize",
+            "recovered": False,
+            "recovery_attempts_used": len(recovery_history),
+            "initial_failure": initial_result,
+            "recovery_history": recovery_history,
+            "final_wait": dict(self.full_shot_last_wait_result or {}),
+        }
+        print(
+            f"❌ [{self._device_label()}] full_shot 初始化坐标重建已用尽，"
+            f"上层将隔离该相机，其余相机继续。"
+        )
+        return False
+
+    def _finish_full_shot_initialization_command_failure(self, reason):
+        self._invalidate_full_shot_position()
+        self.full_shot_last_motion_result = {
+            "ok": False,
+            "reason": reason,
+            "operation": "initialize",
+            "recovered": False,
+            "recovery_attempts_used": 0,
+            "recovery_history": [],
+        }
+        print(
+            f"❌ [{self._device_label()}] full_shot 初始化指令发送失败: reason={reason}。"
+        )
+        return False
+
+    def _finish_full_shot_initialization_success(
+        self,
+        initial_result,
+        recovery_history,
+        recovery_attempts_used,
+    ):
+        final_home = (
+            recovery_history[-1].get("home")
+            if recovery_history else initial_result
+        ) or {}
+        real_angle = final_home.get("real_angle")
+        quality = final_home.get("position_quality", "confirmed")
+        self._update_full_shot_position(real_angle, quality)
+        if self.coordinate_mode == COORDINATE_MODE_HARDWARE:
+            if not self._maybe_set_hardware_zero():
+                return self._finish_full_shot_initialization_command_failure(
+                    "set_hardware_zero_failed"
+                )
+        recovered = recovery_attempts_used > 0
+        self.full_shot_last_motion_result = {
+            "ok": True,
+            "reason": "initialized_after_recovery" if recovered else "initialized",
+            "operation": "initialize",
+            "status": final_home.get("status"),
+            "real_angle": real_angle,
+            "position_quality": quality,
+            "recovered": recovered,
+            "recovery_attempts_used": recovery_attempts_used,
+            "initial_failure": initial_result if recovered else None,
+            "recovery_history": recovery_history,
+            "final_wait": final_home,
+        }
+        print(
+            f"🎉 [{self._device_label()}] full_shot 初始化成功: "
+            f"实测={real_angle}°, position_quality={quality}, "
+            f"recovered={recovered}, recovery_attempts_used={recovery_attempts_used}。"
+        )
+        return True
 
     def return_to_home(self, wait_policy=WAIT_POLICY_LEGACY):
         """调用官方【点击回0】指令；拍摄流程中的回 0，不用于关机收缩。"""

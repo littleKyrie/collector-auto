@@ -448,9 +448,9 @@ stopped, status, real_angle = self._wait_until_stopped(
 )
 ```
 
-`return_to_home()` 和 `move_to_absolute_angle()` 只增加默认值为 `legacy` 的可选 `wait_policy` 参数，并继续返回现有布尔值。focus_calibration 仍按原代码调用 `return_to_home()`；ImageNode 的 full-shot 并发路径显式调用 `move_to_absolute_angle(..., wait_policy="full_shot")`。目标角度为 0 时，`move_to_absolute_angle()` 必须把策略继续传给 `return_to_home(wait_policy=wait_policy)`，避免意外回落到 legacy 分支。
+`initialize_lens()`、`return_to_home()` 和 `move_to_absolute_angle()` 都增加默认值为 `legacy` 的可选 `wait_policy` 参数，并继续返回现有布尔值。focus_calibration 仍按原代码无参数调用 `initialize_lens()`、`return_to_home()`，因此保持原初始化等待和标定行为；ImageNode 的 full-shot 并发路径分别显式调用 `initialize_lens(wait_policy="full_shot")` 和 `move_to_absolute_angle(..., wait_policy="full_shot")`。目标角度为 0 时，`move_to_absolute_angle()` 必须继续使用 full-shot 策略，避免意外回落到 legacy 分支。
 
-full-shot 启动时仍复用原 `initialize_lens()` 完成硬件初始化。初始化成功后，由 `ImageNode.parallel_global_homing()` 上层根据已经校准的 `current_angle` 建立 `full_shot_position_valid=True` 和 `full_shot_position_quality="confirmed"`；初始化失败则隔离对应相机。`initialize_lens()` 本身及其 focus_calibration 行为保持不变。
+full-shot 增强初始化先执行一次既有的“上电找 0 → 点击回 0”，该首次建立坐标不计入 `HOME_RECOVERY_MAX_ATTEMPTS`。首次 home 使用 full-shot wait 验证，因此 `0xFF` 在零点附近连续稳定时可以推断初始化成功；若仍失败，则为本次初始化事件独立执行最多 `HOME_RECOVERY_MAX_ATTEMPTS` 轮坐标系重建。成功后由 `initialize_lens()` 自身写入位置有效性、质量和完整 motion result；全部恢复失败后才由 `ImageNode.parallel_global_homing()` 隔离对应相机。
 
 ### 10.2 状态码与成功条件
 
@@ -920,7 +920,7 @@ self.failed_at_step = None
 - `LensController.py`
   - 在顶部集中增加全部可调阈值及注释。
   - `_wait_until_stopped()` 保留默认值为 `legacy` 的策略参数；legacy 分支保持原逻辑和三元组返回值，full-shot 分支按“正常状态等待 → 必要时稳定窗口”执行并返回详细诊断。
-  - `initialize_lens()` 和 `move_relative_for_calibration()` 的代码及调用方式保持不变。
+  - `initialize_lens()` 增加默认值为 `legacy` 的策略参数；legacy 分支保留原执行顺序，full-shot 分支使用增强 wait 和独立的初始化恢复预算。`move_relative_for_calibration()` 保持不变。
   - `return_to_home()`、`move_to_absolute_angle()` 增加默认值为 `legacy` 的可选策略参数，默认调用行为不变。
   - 增加带 `full_shot_` 前缀的软件坐标有效性、质量、等待结果和操作结果字段。
   - 将单次 home、单次 absolute move、单轮坐标重建和带次数上限的运动协调拆分为非递归辅助函数。
@@ -929,7 +929,7 @@ self.failed_at_step = None
 
 - `ImageNode.py`
   - 为 `ImagingNode` 增加启用/隔离状态和失败上下文。
-  - `parallel_global_homing()` 收集每台镜头的初始化结果；成功时只在上层初始化 full-shot 坐标质量状态，失败时隔离对应相机，不修改 `initialize_lens()`。
+  - `parallel_global_homing()` 显式调用 `initialize_lens(wait_policy="full_shot")` 并收集每台镜头的结构化初始化结果；成功状态由镜头控制器维护，恢复用尽后才隔离对应相机。
   - full-shot 并发移动显式调用 `move_to_absolute_angle(..., wait_policy="full_shot")`；目标为 0 时该方法继续把策略传给共享 `return_to_home()`。
   - 所有并发移动与拍摄函数读取 `future.result()`、返回汇总并过滤隔离相机。
   - 日志中同时带相机名和串口。
@@ -974,7 +974,7 @@ self.failed_at_step = None
 27. **用户中断**：任意等待或恢复阶段按 `Ctrl+C`，`KeyboardInterrupt` 正常向上传播并执行既有资源清理。
 28. **焦距标定零改动兼容**：确认 `focus_calibration` 中 `initialize_lens()`、`return_to_home()`、`move_relative_for_calibration()` 和 `_wait_until_stopped()` 的调用代码段不增加新参数；现有返回结构、边界识别、交互输出和配置结果不变。
 29. **策略隔离检查**：通过静态搜索或单元测试确认只有 ImageNode 的 full-shot 移动路径传入 `wait_policy="full_shot"`，`calibrate_single_lens()` 及其调用链始终使用默认 legacy 策略且不读取 `full_shot_*` 状态字段。
-30. **初始化隔离检查**：full-shot 初始化成功后由 `ImageNode` 上层建立专用坐标状态；初始化失败只隔离对应相机；`initialize_lens()` 本身代码和 focus_calibration 行为不变。
+30. **初始化双策略检查**：focus_calibration 无参数调用 `initialize_lens()` 时保持 legacy；full-shot 全局归零显式传入增强策略。首次 `0xFF` 零点稳定可成功，失败后最多执行两轮初始化坐标重建，恢复用尽才隔离对应相机。
 
 ### 10.12 实施顺序
 
@@ -990,5 +990,6 @@ self.failed_at_step = None
 10. 保持 `ImageNode.py` 当前并发结果传播、相机隔离和拍照过滤机制，并扩展 motion result/metadata 记录恢复历史。
 11. 保持 `main.py` 的持续运行、metadata 异常记录和最终隔离汇总，更新控制台日志文案以区分初始失败、恢复中和恢复用尽。
 12. 增加 mock 状态序列测试，覆盖 10.11 中全部非硬件场景和接口隔离检查。
-13. 回归执行现有 `focus_calibration`，确认调用代码段、交互、等待语义和标定结果零行为变化。
-14. 使用真实镜头调节顶部阈值，验证普通移动读数突变、`0xFF` 稳定、`0xF5`/`0x0B` 边界、两轮坐标重建以及单相机隔离行为。
+13. 为 `initialize_lens()` 增加默认 legacy/full-shot 双策略；让 `parallel_global_homing()` 显式使用增强初始化，并测试首次稳定成功、恢复成功和恢复用尽隔离。
+14. 回归执行现有 `focus_calibration`，确认调用代码段、交互、等待语义和标定结果零行为变化。
+15. 使用真实镜头调节顶部阈值，验证初始化与普通移动的 `0xFF` 稳定、`0xF5`/`0x0B` 边界、两轮坐标重建以及单相机隔离行为。
