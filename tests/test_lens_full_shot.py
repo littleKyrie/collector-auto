@@ -93,7 +93,7 @@ class FullShotWaitTests(unittest.TestCase):
         )
 
     def test_stopped_but_wrong_position_fails(self):
-        lens, result = self.run_wait([(0x00, 20.0)])
+        lens, result = self.run_wait([(0x00, 20.0), (0x00, 20.0)])
 
         self.assertFalse(result[0])
         self.assertEqual(
@@ -102,13 +102,36 @@ class FullShotWaitTests(unittest.TestCase):
         )
 
     def test_wrong_boundary_during_home_fails(self):
-        lens, result = self.run_wait([(0x0B, 0.0)])
+        lens, result = self.run_wait([(0x0B, 0.0), (0x0B, 0.0)])
 
         self.assertFalse(result[0])
         self.assertEqual(
             lens.full_shot_last_wait_result["reason"],
-            "boundary_position_mismatch",
+            "boundary_direction_mismatch",
         )
+
+    def test_single_bad_terminal_sample_is_confirmed_as_transient(self):
+        lens, result = self.run_wait([
+            (0x00, 20.0),
+            (0x00, 0.2),
+        ])
+
+        self.assertTrue(result[0])
+        self.assertEqual(
+            lens.full_shot_last_wait_result["reason"],
+            "confirmed_stopped_at_target",
+        )
+        self.assertEqual(
+            lens.full_shot_last_wait_result["terminal_mismatch_samples"],
+            1,
+        )
+
+    def test_stability_is_not_accepted_before_normal_timeout(self):
+        sequence = [(0xFF, -0.1)] * 20 + [(0x00, 0.0)]
+        lens, result = self.run_wait(sequence)
+
+        self.assertTrue(result[0])
+        self.assertGreaterEqual(lens.index, 3)
 
     def test_legacy_default_keeps_existing_ff_timeout_behavior(self):
         lens = SequenceLens([(0xFF, -2.65)])
@@ -163,6 +186,137 @@ class FullShotRecoveryTests(unittest.TestCase):
         self.assertTrue(lens.full_shot_last_motion_result["recovered"])
         self.assertTrue(lens.full_shot_position_valid)
         self.assertAlmostEqual(lens.current_angle, 0.1)
+
+    @staticmethod
+    def failed_move(reason="stopped_position_mismatch"):
+        return {
+            "ok": False,
+            "reason": reason,
+            "operation": "absolute_move",
+            "status": 0x00,
+            "real_angle": -0.03,
+        }
+
+    @staticmethod
+    def successful_move(angle=1700.0):
+        return {
+            "ok": True,
+            "reason": "confirmed_stopped_at_target",
+            "operation": "absolute_move",
+            "status": 0x00,
+            "real_angle": angle,
+            "position_quality": "confirmed",
+        }
+
+    def make_open_lens(self):
+        lens = LensController("TEST")
+        lens.serial = mock.Mock(is_open=True)
+        lens.full_shot_position_valid = True
+        lens.full_shot_position_quality = "confirmed"
+        return lens
+
+    def test_absolute_move_rebuilds_coordinates_and_replays_target(self):
+        lens = self.make_open_lens()
+        with mock.patch.object(
+            lens,
+            "_execute_absolute_move_once",
+            side_effect=[self.failed_move(), self.successful_move()],
+        ) as execute_move, mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            return_value={"ok": True, "reason": "coordinate_rebuild_succeeded", "home": {"ok": True}},
+        ) as rebuild, contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.move_to_absolute_angle(1700.0, wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertTrue(ok)
+        self.assertEqual(execute_move.call_count, 2)
+        rebuild.assert_called_once_with(1)
+        self.assertTrue(lens.full_shot_last_motion_result["recovered"])
+        self.assertEqual(lens.full_shot_last_motion_result["recovery_attempts_used"], 1)
+
+    def test_second_recovery_restarts_from_coordinate_rebuild(self):
+        lens = self.make_open_lens()
+        with mock.patch.object(
+            lens,
+            "_execute_absolute_move_once",
+            side_effect=[
+                self.failed_move(),
+                self.failed_move("timeout_still_moving"),
+                self.successful_move(),
+            ],
+        ), mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            side_effect=[
+                {"ok": True, "reason": "coordinate_rebuild_succeeded", "home": {"ok": True}},
+                {"ok": True, "reason": "coordinate_rebuild_succeeded", "home": {"ok": True}},
+            ],
+        ) as rebuild, contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.move_to_absolute_angle(1700.0, wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertTrue(ok)
+        self.assertEqual(rebuild.call_count, 2)
+        self.assertEqual(lens.full_shot_last_motion_result["recovery_attempts_used"], 2)
+
+    def test_recovery_budget_resets_for_each_new_motion(self):
+        lens = self.make_open_lens()
+        with mock.patch.object(
+            lens,
+            "_execute_absolute_move_once",
+            side_effect=[
+                self.failed_move(), self.successful_move(1000.0),
+                self.failed_move(), self.successful_move(1200.0),
+            ],
+        ), mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            return_value={"ok": True, "reason": "coordinate_rebuild_succeeded", "home": {"ok": True}},
+        ) as rebuild, contextlib.redirect_stdout(io.StringIO()):
+            first = lens.move_to_absolute_angle(1000.0, wait_policy=WAIT_POLICY_FULL_SHOT)
+            first_attempts = lens.full_shot_last_motion_result["recovery_attempts_used"]
+            second = lens.move_to_absolute_angle(1200.0, wait_policy=WAIT_POLICY_FULL_SHOT)
+            second_attempts = lens.full_shot_last_motion_result["recovery_attempts_used"]
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(rebuild.call_count, 2)
+        self.assertEqual((first_attempts, second_attempts), (1, 1))
+
+    def test_exhausted_recovery_returns_structured_failure(self):
+        lens = self.make_open_lens()
+        with mock.patch.object(
+            lens,
+            "_execute_absolute_move_once",
+            side_effect=[self.failed_move()],
+        ), mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            side_effect=[
+                {"ok": False, "reason": "recovery_home_failed", "home": {"ok": False}},
+                {"ok": False, "reason": "recovery_home_failed", "home": {"ok": False}},
+            ],
+        ), contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.move_to_absolute_angle(1700.0, wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertFalse(ok)
+        self.assertEqual(lens.full_shot_last_motion_result["reason"], "coordinate_recovery_exhausted")
+        self.assertEqual(lens.full_shot_last_motion_result["recovery_attempts_used"], 2)
+        self.assertFalse(lens.full_shot_position_valid)
+
+    def test_out_of_range_target_is_clamped_before_motion(self):
+        lens = self.make_open_lens()
+        with mock.patch.object(
+            lens,
+            "_execute_full_shot_motion_with_recovery",
+            return_value=True,
+        ) as execute, contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.move_to_absolute_angle(9999.0, wait_policy=WAIT_POLICY_FULL_SHOT)
+
+        self.assertTrue(ok)
+        kwargs = execute.call_args.kwargs
+        self.assertEqual(kwargs["requested_angle"], 9999.0)
+        self.assertEqual(kwargs["effective_target"], lens_module.MOTOR_ANGLE_MAX)
+        self.assertTrue(kwargs["target_clamped"])
 
 
 if __name__ == "__main__":

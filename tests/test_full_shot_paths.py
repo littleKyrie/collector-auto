@@ -272,7 +272,7 @@ class FullShotIntegrationTests(unittest.TestCase):
                 def parallel_snap_rotation_step(self, root, position, step, **kwargs):
                     camera_dir = os.path.join(root, "1")
                     os.makedirs(camera_dir, exist_ok=True)
-                    Path(camera_dir, f"Position{position}_Step{step}.bmp").write_bytes(b"bmp")
+                    Path(camera_dir, f"Position{position}_Step{step}.jpg").write_bytes(b"jpg")
                     return {
                         "ok": True,
                         "successful": ["1"],
@@ -343,8 +343,8 @@ class FullShotIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertFalse(os.path.exists(os.path.join(output_path, "stale.txt")))
-            self.assertTrue(os.path.isfile(os.path.join(output_path, "1", "Position1_Step1.bmp")))
-            self.assertTrue(os.path.isfile(os.path.join(output_path, "1", "Position2_Step1.bmp")))
+            self.assertTrue(os.path.isfile(os.path.join(output_path, "1", "Position1_Step1.jpg")))
+            self.assertTrue(os.path.isfile(os.path.join(output_path, "1", "Position2_Step1.jpg")))
 
             metadata_files = sorted(Path(log_path).glob("*/*_metadata.json"))
             self.assertEqual(len(metadata_files), 2)
@@ -355,7 +355,7 @@ class FullShotIntegrationTests(unittest.TestCase):
                 main.metadata_path(os.path.join(
                     output_path,
                     "{camera_user_id}",
-                    "Position{i}_Step{j}.bmp",
+                    "Position{i}_Step{j}.jpg",
                 )),
             )
 

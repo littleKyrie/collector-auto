@@ -40,7 +40,7 @@ lens_range_map = load_lens_range_map() or {}
 当前图片结构已经是：
 
 ```text
-Output/{camera_user_id}/Position{i}_Step{j}.bmp
+Output/{camera_user_id}/Position{i}_Step{j}.jpg
 ```
 
 但运行开始前不会清空 `Output`，因此同名图片会被覆盖，不同参数运行遗留的其他图片仍可能保留。
@@ -74,14 +74,14 @@ python main.py --full_shot --output_path C://results
 假设当前读取到的相机名为 `1`、`2`，图片分别保存到：
 
 ```text
-C://results/1/Position1_Step1.bmp
-C://results/2/Position1_Step1.bmp
+C://results/1/Position1_Step1.jpg
+C://results/2/Position1_Step1.jpg
 ```
 
 后续阵位和镜头步进继续使用现有命名规则：
 
 ```text
-{output_path}/{camera_user_id}/Position{i}_Step{j}.bmp
+{output_path}/{camera_user_id}/Position{i}_Step{j}.jpg
 ```
 
 ### 3.2 `--config_path`
@@ -252,7 +252,7 @@ output_root = args.output_path
 ```json
 {
   "lens_range_map_path": "configs/lens_range_map.json",
-  "image_path_pattern": "Output/{camera_user_id}/Position{i}_Step{j}.bmp"
+  "image_path_pattern": "Output/{camera_user_id}/Position{i}_Step{j}.jpg"
 }
 ```
 
@@ -261,7 +261,7 @@ output_root = args.output_path
 ```json
 {
   "lens_range_map_path": "<resolved config_path>",
-  "image_path_pattern": "<resolved output_path>/{camera_user_id}/Position{i}_Step{j}.bmp"
+  "image_path_pattern": "<resolved output_path>/{camera_user_id}/Position{i}_Step{j}.jpg"
 }
 ```
 
@@ -277,7 +277,7 @@ output_root = args.output_path
 README 中现有图片目录示例与当前代码已经不一致，更新时应直接采用实际结构：
 
 ```text
-{output_path}/{camera_user_id}/Position{i}_Step{j}.bmp
+{output_path}/{camera_user_id}/Position{i}_Step{j}.jpg
 ```
 
 ## 6. 预计影响文件
@@ -331,7 +331,7 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 通过硬件联调或 mock 验证：
 
 - `--output_path C://results` 且相机名为 `1`、`2` 时，会生成 `C://results/1/` 和 `C://results/2/`。
-- 图片名称仍为 `Position{i}_Step{j}.bmp`。
+- 图片名称仍为 `Position{i}_Step{j}.jpg`。
 - 运行前遗留文件已全部清除，不只覆盖同名图片。
 - 输出目录在整轮任务中仅清理一次，多阵位和多 step 图片不会互相清除。
 - 指定自定义输出目录时，默认 `Output` 不会被创建或清理。
@@ -346,7 +346,7 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 - [ ] 每次正式拍摄前只清理一次所选输出根目录的旧内容。
 - [ ] 清理失败或目标路径危险时不会启动拍摄。
 - [ ] 自定义配置路径不会静默回退到默认配置文件。
-- [ ] 图片命名和 BMP 格式保持不变。
+- [ ] 图片命名和 JPG 格式保持不变。
 - [ ] step metadata 记录本次运行真实使用的配置路径和输出路径。
 - [ ] `focus_calibration` 的现有配置读写行为不受影响。
 - [ ] 帮助命令无文件系统和硬件副作用。

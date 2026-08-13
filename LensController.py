@@ -1,4 +1,5 @@
 import serial
+import math
 import struct
 import time
 
@@ -26,6 +27,10 @@ HOME_ANGLE_TOLERANCE = 5.0  # 度
 # full_shot 普通绝对角度移动的到位容差；应比回零容差严格。
 MOVE_ANGLE_TOLERANCE = 2.0  # 度
 
+# 电机内部坐标允许的物理范围。不要与 lens_range_map 的拍摄焦距范围混用。
+MOTOR_ANGLE_MIN = 0.0  # 度
+MOTOR_ANGLE_MAX = 2900.0  # 度
+
 # full_shot 连续角度稳定所需时间；现场联调时可按电机响应调整。
 POSITION_STABLE_DURATION = 1.0  # 秒
 
@@ -35,16 +40,23 @@ POSITION_STABLE_ANGLE_SPAN = 0.5  # 度
 # full_shot 状态轮询间隔。
 POSITION_POLL_INTERVAL = 0.5  # 秒
 
+# 终态与目标不符时，需要连续得到的异常确认样本数。
+TERMINAL_MISMATCH_CONFIRM_SAMPLES = 2
+
+# 单次等待内允许的连续无效串口读取次数。
+SERIAL_READ_FAILURE_LIMIT = 3
+
 # full_shot 回零的正常等待时间与单次尝试绝对截止时间。
 HOME_NORMAL_TIMEOUT = 10.0  # 秒
 HOME_HARD_TIMEOUT = 15.0  # 秒
 
 # full_shot 普通移动的正常等待时间与绝对截止时间。
-MOVE_NORMAL_TIMEOUT = 4.0  # 秒
-MOVE_HARD_TIMEOUT = 8.0  # 秒
+MOVE_NORMAL_TIMEOUT = 5.0  # 秒
+MOVE_HARD_TIMEOUT = 10.0  # 秒
 
-# full_shot 回零失败后，厂商“上电找 0 -> 点击回 0”恢复次数。
-HOME_RECOVERY_MAX_ATTEMPTS = 1
+# 单台镜头、单次原始运动失败后允许执行的完整坐标系重建次数。
+# 该计数不跨阵位累计，也不包含 full_shot 启动时的初始化归零。
+HOME_RECOVERY_MAX_ATTEMPTS = 2
 
 # 厂商“上电找 0”指令后的静默等待时间。
 POWER_ON_HOMING_WAIT = 10.0  # 秒
@@ -163,12 +175,20 @@ class LensController:
             "status": -1,
             "real_angle": None,
             "expected_angle": None,
+            "requested_angle": None,
+            "effective_target": None,
+            "target_clamped": False,
             "deviation": None,
             "position_quality": "unknown",
             "stable_duration": 0.0,
             "stable_span": None,
             "elapsed": 0.0,
             "boundary": None,
+            "motion_direction": None,
+            "normal_timeout_reached": False,
+            "hard_timeout_reached": False,
+            "terminal_mismatch_samples": 0,
+            "serial_read_failures": 0,
         }
         result.update(values)
         self.full_shot_last_wait_result = result
@@ -178,7 +198,8 @@ class LensController:
                             expected_angle=None, angle_tolerance=None,
                             wait_policy=WAIT_POLICY_LEGACY,
                             normal_timeout_s=None, hard_timeout_s=None,
-                            operation=None, motion_direction=None):
+                            operation=None, motion_direction=None,
+                            requested_angle=None, target_clamped=False):
         if wait_policy not in VALID_WAIT_POLICIES:
             raise ValueError(f"Unsupported wait policy: {wait_policy}")
 
@@ -191,6 +212,8 @@ class LensController:
                 hard_timeout_s=hard_timeout_s if hard_timeout_s is not None else timeout_s,
                 interval_s=interval_s,
                 motion_direction=motion_direction,
+                requested_angle=requested_angle,
+                target_clamped=target_clamped,
             )
 
         # legacy 分支供 focus_calibration 等既有调用使用，保持原有行为。
@@ -236,6 +259,8 @@ class LensController:
         hard_timeout_s,
         interval_s=POSITION_POLL_INTERVAL,
         motion_direction=None,
+        requested_angle=None,
+        target_clamped=False,
     ):
         if operation not in ("home", "absolute_move"):
             raise ValueError(f"Unsupported full_shot operation: {operation}")
@@ -244,13 +269,43 @@ class LensController:
         if hard_timeout_s < normal_timeout_s:
             raise ValueError("hard_timeout_s must be >= normal_timeout_s")
 
+        requested_angle = expected_angle if requested_angle is None else requested_angle
         start_t = time.monotonic()
         last_status = -1
         last_angle = None
         last_logged_status = None
-        candidate_started_at = None
-        candidate_angles = []
+        stable_started_at = None
+        stable_angles = []
         normal_timeout_logged = False
+        serial_read_failures = 0
+        terminal_reason = None
+        terminal_status = None
+        terminal_mismatch_samples = 0
+
+        def store_result(ok, reason, status, real_angle, elapsed, **extra):
+            deviation = (
+                abs(real_angle - expected_angle)
+                if real_angle is not None else None
+            )
+            return self._store_full_shot_wait_result(
+                ok=ok,
+                reason=reason,
+                operation=operation,
+                status=status,
+                real_angle=real_angle,
+                expected_angle=expected_angle,
+                requested_angle=requested_angle,
+                effective_target=expected_angle,
+                target_clamped=target_clamped,
+                deviation=deviation,
+                elapsed=elapsed,
+                motion_direction=motion_direction,
+                normal_timeout_reached=elapsed >= normal_timeout_s,
+                hard_timeout_reached=elapsed >= hard_timeout_s,
+                terminal_mismatch_samples=terminal_mismatch_samples,
+                serial_read_failures=serial_read_failures,
+                **extra,
+            )
 
         while True:
             now = time.monotonic()
@@ -264,213 +319,187 @@ class LensController:
             if real_angle is not None:
                 self.last_measured_angle = real_angle
 
-            deviation = (
-                abs(real_angle - expected_angle)
-                if real_angle is not None else None
-            )
-            within_tolerance = (
-                deviation is not None and deviation <= angle_tolerance
-            )
-            status_text = self._format_status(status)
+            if status == -1 or real_angle is None:
+                serial_read_failures += 1
+                if serial_read_failures >= SERIAL_READ_FAILURE_LIMIT:
+                    store_result(False, "serial_read_failed", status, real_angle, elapsed)
+                    return False, status, real_angle
+                time.sleep(interval_s)
+                continue
+            serial_read_failures = 0
 
+            deviation = abs(real_angle - expected_angle)
+            within_tolerance = deviation <= angle_tolerance
+            status_text = self._format_status(status)
             if status != last_logged_status:
                 print(
                     f"      [{self._device_label()}] {operation} 状态变化: status={status_text}, "
-                    f"内部角度={real_angle}°, 目标={expected_angle:.2f}°, "
-                    f"偏差={deviation if deviation is not None else 'N/A'}°"
+                    f"内部角度={real_angle}°, 有效目标={expected_angle:.2f}°, 偏差={deviation:.2f}°"
                 )
                 last_logged_status = status
 
+            success_reason = None
+            mismatch_reason = None
+            boundary = None
             if status == 0x00:
                 if within_tolerance:
-                    self._store_full_shot_wait_result(
-                        ok=True,
-                        reason="confirmed_stopped_at_target",
-                        operation=operation,
-                        status=status,
-                        real_angle=real_angle,
-                        expected_angle=expected_angle,
-                        deviation=deviation,
-                        position_quality="confirmed",
-                        elapsed=elapsed,
-                    )
-                    return True, status, real_angle
-
-                self._store_full_shot_wait_result(
-                    reason="stopped_position_mismatch",
-                    operation=operation,
-                    status=status,
-                    real_angle=real_angle,
-                    expected_angle=expected_angle,
-                    deviation=deviation,
-                    elapsed=elapsed,
-                )
-                print(
-                    f"❌ [{self._device_label()}] 电机已停稳但位置不符: status={status_text}, "
-                    f"实测={real_angle}°, 目标={expected_angle:.2f}°, "
-                    f"容差={angle_tolerance:.2f}°"
-                )
-                return False, status, real_angle
-
-            if status in LENS_BOUNDARY_STATUSES:
+                    success_reason = "confirmed_stopped_at_target"
+                else:
+                    mismatch_reason = "stopped_position_mismatch"
+            elif status in LENS_BOUNDARY_STATUSES:
                 boundary = "zero" if status == LENS_BOUNDARY_ZERO else "far"
                 if operation == "home":
-                    boundary_matches_operation = status == LENS_BOUNDARY_ZERO
+                    direction_matches = status == LENS_BOUNDARY_ZERO
                 elif motion_direction is None or motion_direction == 0:
-                    boundary_matches_operation = False
+                    direction_matches = False
                 elif status == LENS_BOUNDARY_ZERO:
-                    boundary_matches_operation = motion_direction < 0
+                    direction_matches = motion_direction < 0
                 else:
-                    boundary_matches_operation = motion_direction > 0
-                if within_tolerance and boundary_matches_operation:
-                    reason = (
+                    direction_matches = motion_direction > 0
+
+                boundary_target = (
+                    MOTOR_ANGLE_MIN if status == LENS_BOUNDARY_ZERO else MOTOR_ANGLE_MAX
+                )
+                target_matches_boundary = (
+                    abs(expected_angle - boundary_target) <= BOUNDARY_ANGLE_TOLERANCE
+                )
+                position_matches_boundary = (
+                    abs(real_angle - boundary_target) <= BOUNDARY_ANGLE_TOLERANCE
+                )
+                if direction_matches and target_matches_boundary and position_matches_boundary:
+                    success_reason = (
                         "confirmed_zero_boundary"
                         if boundary == "zero" else "confirmed_far_boundary"
                     )
-                    self._store_full_shot_wait_result(
-                        ok=True,
-                        reason=reason,
-                        operation=operation,
-                        status=status,
-                        real_angle=real_angle,
-                        expected_angle=expected_angle,
-                        deviation=deviation,
-                        position_quality="confirmed",
-                        elapsed=elapsed,
-                        boundary=boundary,
-                        motion_direction=motion_direction,
-                    )
-                    print(
-                        f"✅ [{self._device_label()}] 物理{boundary}边界与目标一致: "
-                        f"status={status_text}, 实测={real_angle:.2f}°, "
-                        f"偏差={deviation:.2f}°"
-                    )
-                    return True, status, real_angle
-
-                self._store_full_shot_wait_result(
-                    reason="boundary_position_mismatch",
-                    operation=operation,
-                    status=status,
-                    real_angle=real_angle,
-                    expected_angle=expected_angle,
-                    deviation=deviation,
-                    elapsed=elapsed,
-                    boundary=boundary,
-                    motion_direction=motion_direction,
-                )
-                print(
-                    f"❌ [{self._device_label()}] 物理边界与本次目标/方向不符: "
-                    f"status={status_text}, boundary={boundary}, "
-                    f"motion_direction={motion_direction}, 实测={real_angle}°, "
-                    f"目标={expected_angle:.2f}°"
-                )
-                return False, status, real_angle
-
-            if status in (0x01, 0xFF) and within_tolerance:
-                if candidate_started_at is None:
-                    candidate_started_at = now
-                    candidate_angles = [real_angle]
-                    print(
-                        f"⚠️ [{self._device_label()}] status={status_text} 但角度已进入目标容差，"
-                        f"开始稳定候选: 实测={real_angle:.2f}°, 偏差={deviation:.2f}°"
-                    )
+                elif not direction_matches:
+                    mismatch_reason = "boundary_direction_mismatch"
                 else:
-                    candidate_angles.append(real_angle)
+                    mismatch_reason = "boundary_position_mismatch"
 
-                stable_duration = now - candidate_started_at
-                stable_span = max(candidate_angles) - min(candidate_angles)
-                if stable_span > POSITION_STABLE_ANGLE_SPAN:
+            if success_reason is not None:
+                if terminal_mismatch_samples:
                     print(
-                        f"⚠️ [{self._device_label()}] 稳定候选角度极差超限: "
-                        f"{stable_span:.2f}° > {POSITION_STABLE_ANGLE_SPAN:.2f}°；"
-                        f"从当前读数重新开始观察。"
+                        f"⚠️ [{self._device_label()}] 此前终态读数不一致，复核样本已恢复正常；"
+                        f"不触发坐标重建。"
                     )
-                    candidate_started_at = now
-                    candidate_angles = [real_angle]
-                    stable_duration = 0.0
-                    stable_span = 0.0
-                if (
-                    stable_duration >= POSITION_STABLE_DURATION
-                    and stable_span <= POSITION_STABLE_ANGLE_SPAN
-                ):
-                    self._store_full_shot_wait_result(
-                        ok=True,
-                        reason="inferred_stable_at_target",
-                        operation=operation,
-                        status=status,
-                        real_angle=real_angle,
-                        expected_angle=expected_angle,
-                        deviation=deviation,
-                        position_quality="inferred",
-                        stable_duration=stable_duration,
-                        stable_span=stable_span,
-                        elapsed=elapsed,
-                        boundary="zero" if operation == "home" else None,
-                    )
-                    print(
-                        f"✅ [{self._device_label()}] status={status_text} 目标附近连续稳定 "
-                        f"{stable_duration:.2f}s，角度极差={stable_span:.2f}°；"
-                        f"推断已到位。"
-                    )
-                    return True, status, real_angle
-            elif candidate_started_at is not None:
-                stable_span = (
-                    max(candidate_angles) - min(candidate_angles)
-                    if candidate_angles else None
+                store_result(
+                    True,
+                    success_reason,
+                    status,
+                    real_angle,
+                    elapsed,
+                    position_quality="confirmed",
+                    boundary=boundary,
                 )
-                print(
-                    f"⚠️ [{self._device_label()}] 取消稳定候选: status={status_text}, "
-                    f"内部角度={real_angle}°, 已观测极差={stable_span}°"
-                )
-                candidate_started_at = None
-                candidate_angles = []
+                return True, status, real_angle
 
-            if elapsed >= normal_timeout_s and not normal_timeout_logged:
-                normal_timeout_logged = True
+            if mismatch_reason is not None:
+                if terminal_reason == mismatch_reason and terminal_status == status:
+                    terminal_mismatch_samples += 1
+                else:
+                    terminal_reason = mismatch_reason
+                    terminal_status = status
+                    terminal_mismatch_samples = 1
                 print(
-                    f"⚠️ [{self._device_label()}] 已达到正常等待时间 {normal_timeout_s:.2f}s，"
-                    f"继续观察至硬超时 {hard_timeout_s:.2f}s。"
+                    f"⚠️ [{self._device_label()}] 终态校验不符候选 "
+                    f"{terminal_mismatch_samples}/{TERMINAL_MISMATCH_CONFIRM_SAMPLES}: "
+                    f"reason={mismatch_reason}, status={status_text}, 实测={real_angle:.2f}°, "
+                    f"有效目标={expected_angle:.2f}°。"
                 )
+                if terminal_mismatch_samples >= TERMINAL_MISMATCH_CONFIRM_SAMPLES:
+                    store_result(
+                        False,
+                        mismatch_reason,
+                        status,
+                        real_angle,
+                        elapsed,
+                        boundary=boundary,
+                    )
+                    return False, status, real_angle
+                time.sleep(interval_s)
+                continue
+
+            # 终态异常候选只用于连续终态复核；一旦状态离开该异常终态，
+            # 后续结果应按新的状态重新判断，不能把旧候选带到硬超时。
+            terminal_reason = None
+            terminal_status = None
+            terminal_mismatch_samples = 0
+
+            if elapsed >= normal_timeout_s:
+                if not normal_timeout_logged:
+                    normal_timeout_logged = True
+                    print(
+                        f"⚠️ [{self._device_label()}] 正常等待 {normal_timeout_s:.2f}s 已到期，"
+                        f"状态仍为 {status_text}；进入稳定窗口，硬截止={hard_timeout_s:.2f}s。"
+                    )
+                if status in (0x01, 0xFF) and within_tolerance:
+                    if stable_started_at is None:
+                        stable_started_at = now
+                        stable_angles = [real_angle]
+                    else:
+                        stable_angles.append(real_angle)
+                    stable_duration = now - stable_started_at
+                    stable_span = max(stable_angles) - min(stable_angles)
+                    if stable_span > POSITION_STABLE_ANGLE_SPAN:
+                        stable_started_at = now
+                        stable_angles = [real_angle]
+                        stable_duration = 0.0
+                        stable_span = 0.0
+                    if stable_duration >= POSITION_STABLE_DURATION:
+                        store_result(
+                            True,
+                            "inferred_stable_at_target",
+                            status,
+                            real_angle,
+                            elapsed,
+                            position_quality="inferred",
+                            stable_duration=stable_duration,
+                            stable_span=stable_span,
+                            boundary="zero" if operation == "home" else None,
+                        )
+                        print(
+                            f"✅ [{self._device_label()}] 持续运动状态下目标附近稳定 "
+                            f"{stable_duration:.2f}s，角度极差={stable_span:.2f}°；推断到位。"
+                        )
+                        return True, status, real_angle
+                else:
+                    stable_started_at = None
+                    stable_angles = []
 
             time.sleep(interval_s)
 
+        elapsed = time.monotonic() - start_t
         stable_duration = (
-            time.monotonic() - candidate_started_at
-            if candidate_started_at is not None else 0.0
+            time.monotonic() - stable_started_at
+            if stable_started_at is not None else 0.0
         )
         stable_span = (
-            max(candidate_angles) - min(candidate_angles)
-            if candidate_angles else None
+            max(stable_angles) - min(stable_angles)
+            if stable_angles else None
         )
-        if last_status == -1:
+        if terminal_mismatch_samples:
+            reason = "inconsistent_terminal_feedback"
+        elif last_status == -1 or serial_read_failures:
             reason = "serial_read_failed"
-        elif candidate_started_at is not None:
+        elif stable_started_at is not None:
             reason = "timeout_unstable_at_target"
         elif last_status in (0x01, 0xFF):
             reason = "timeout_still_moving"
         else:
             reason = "unexpected_status"
-
-        elapsed = time.monotonic() - start_t
-        deviation = (
-            abs(last_angle - expected_angle)
-            if last_angle is not None else None
-        )
-        self._store_full_shot_wait_result(
-            reason=reason,
-            operation=operation,
-            status=last_status,
-            real_angle=last_angle,
-            expected_angle=expected_angle,
-            deviation=deviation,
+        store_result(
+            False,
+            reason,
+            last_status,
+            last_angle,
+            elapsed,
             stable_duration=stable_duration,
             stable_span=stable_span,
-            elapsed=elapsed,
         )
         print(
             f"❌ [{self._device_label()}] full_shot 等待失败: reason={reason}, "
             f"status={self._format_status(last_status)}, 实测={last_angle}°, "
-            f"目标={expected_angle:.2f}°, elapsed={elapsed:.2f}s"
+            f"有效目标={expected_angle:.2f}°, elapsed={elapsed:.2f}s"
         )
         return False, last_status, last_angle
 
@@ -613,114 +642,317 @@ class LensController:
         return False
 
     def _return_to_home_for_full_shot(self):
+        return self._execute_full_shot_motion_with_recovery(
+            operation="home",
+            requested_angle=0.0,
+            effective_target=0.0,
+            target_clamped=False,
+        )
+
+    @staticmethod
+    def _full_shot_failure_is_recoverable(reason):
+        return reason in {
+            "coordinate_invalid",
+            "stopped_position_mismatch",
+            "boundary_position_mismatch",
+            "boundary_direction_mismatch",
+            "inconsistent_terminal_feedback",
+            "timeout_still_moving",
+            "timeout_unstable_at_target",
+            "serial_read_failed",
+            "unexpected_status",
+        }
+
+    def _execute_home_once(self):
+        print(f"🔙 [{self._device_label()}] 正在执行官方【点击回0】指令...")
+        if not self.send_command(LENS_RETURN_HOME_COMMAND, wait_time=0.5):
+            result = {
+                "ok": False,
+                "reason": "return_home_command_failed",
+                "operation": "home",
+                "status": -1,
+                "real_angle": None,
+                "position_quality": "unknown",
+            }
+            self.full_shot_last_wait_result = result
+            return result
+
+        stopped, status, real_angle = self._wait_until_stopped(
+            timeout_s=HOME_NORMAL_TIMEOUT,
+            interval_s=POSITION_POLL_INTERVAL,
+            expected_angle=MOTOR_ANGLE_MIN,
+            angle_tolerance=HOME_ANGLE_TOLERANCE,
+            wait_policy=WAIT_POLICY_FULL_SHOT,
+            normal_timeout_s=HOME_NORMAL_TIMEOUT,
+            hard_timeout_s=HOME_HARD_TIMEOUT,
+            operation="home",
+            motion_direction=-1,
+            requested_angle=0.0,
+            target_clamped=False,
+        )
+        result = dict(self.full_shot_last_wait_result or {})
+        if stopped:
+            self._update_full_shot_position(
+                real_angle,
+                result.get("position_quality", "confirmed"),
+            )
+        else:
+            self._invalidate_full_shot_position(real_angle)
+        result["status"] = status
+        result["real_angle"] = real_angle
+        return result
+
+    def _build_relative_move_frame(self, delta_angle, speed_rpm):
+        v_val = int(speed_rpm * self.encoder_res / 6000)
+        angle_signed_val = int(delta_angle * self.encoder_res / 360)
+        header = bytes([0x01, 0x64, 0x01])
+        tail = bytes([0x00, 0x00, 0x00])
+        cmd_without_crc = (
+            header
+            + struct.pack('>I', v_val)
+            + struct.pack('>i', angle_signed_val)
+            + tail
+        )
+        return cmd_without_crc + self._calc_crc16(cmd_without_crc)
+
+    def _execute_absolute_move_once(
+        self,
+        requested_angle,
+        effective_target,
+        target_clamped,
+        speed_rpm,
+    ):
+        if not self.full_shot_position_valid:
+            return {
+                "ok": False,
+                "reason": "coordinate_invalid",
+                "operation": "absolute_move",
+                "requested_angle": requested_angle,
+                "effective_target": effective_target,
+                "target_clamped": target_clamped,
+                "status": -1,
+                "real_angle": self.last_measured_angle,
+            }
+
+        delta_angle = effective_target - self.current_angle
+        motion_direction = 1 if delta_angle > 0 else -1 if delta_angle < 0 else 0
+        if abs(delta_angle) >= 0.1:
+            full_cmd = self._build_relative_move_frame(delta_angle, speed_rpm)
+            print(f"原始发送报文: {full_cmd.hex(' ').upper()}")
+            print(
+                f"      软件坐标: 当前={self.current_angle:.2f}°, "
+                f"有效目标={effective_target:.2f}°, 相对位移={delta_angle:.2f}°"
+            )
+            try:
+                self.serial.reset_input_buffer()
+                self.serial.write(full_cmd)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "move_command_failed",
+                    "operation": "absolute_move",
+                    "requested_angle": requested_angle,
+                    "effective_target": effective_target,
+                    "target_clamped": target_clamped,
+                    "error": str(exc),
+                    "status": -1,
+                    "real_angle": None,
+                }
+            estimated_move_time = (abs(delta_angle) / 1000.0) * 0.87
+            bulk_sleep_time = min(4.0, max(0.1, estimated_move_time - 0.1))
+            print(f"      ...指令下发，执行大段静默等待: {bulk_sleep_time:.2f}s...")
+            time.sleep(bulk_sleep_time)
+
+        stopped, status, real_angle = self._wait_until_stopped(
+            timeout_s=MOVE_NORMAL_TIMEOUT,
+            interval_s=POSITION_POLL_INTERVAL,
+            expected_angle=effective_target,
+            angle_tolerance=MOVE_ANGLE_TOLERANCE,
+            wait_policy=WAIT_POLICY_FULL_SHOT,
+            normal_timeout_s=MOVE_NORMAL_TIMEOUT,
+            hard_timeout_s=MOVE_HARD_TIMEOUT,
+            operation="absolute_move",
+            motion_direction=motion_direction,
+            requested_angle=requested_angle,
+            target_clamped=target_clamped,
+        )
+        result = dict(self.full_shot_last_wait_result or {})
+        result.update({
+            "operation": "absolute_move",
+            "requested_angle": requested_angle,
+            "effective_target": effective_target,
+            "target_clamped": target_clamped,
+            "status": status,
+            "real_angle": real_angle,
+        })
+        if stopped:
+            self._update_full_shot_position(
+                real_angle,
+                result.get("position_quality", "confirmed"),
+            )
+            print(
+                f"✅ [{self._device_label()}] 绝对移动验证成功: "
+                f"实测={real_angle:.2f}°, 有效目标={effective_target:.2f}°。"
+            )
+        else:
+            self._invalidate_full_shot_position(real_angle)
+        return result
+
+    def _rebuild_coordinate_system_once(self, attempt_number):
+        print(
+            f"⚠️ [{self._device_label()}] 执行坐标系重建 "
+            f"{attempt_number}/{HOME_RECOVERY_MAX_ATTEMPTS}: 上电找0 -> 点击回0。"
+        )
+        if not self.send_command(LENS_POWER_ON_HOMING_COMMAND, wait_time=0.5):
+            return {
+                "ok": False,
+                "reason": "power_on_homing_command_failed",
+                "operation": "coordinate_rebuild",
+                "attempt": attempt_number,
+            }
+        print(
+            f"⏳ [{self._device_label()}] 等待 {POWER_ON_HOMING_WAIT:.2f}s，"
+            f"供上电找0完成。"
+        )
+        time.sleep(POWER_ON_HOMING_WAIT)
+        result = self._execute_home_once()
+        home_reason = result.get("reason")
+        return {
+            "ok": bool(result.get("ok")),
+            "reason": (
+                "coordinate_rebuild_succeeded"
+                if result.get("ok")
+                else home_reason
+                if home_reason == "return_home_command_failed"
+                else "recovery_home_failed"
+            ),
+            "operation": "coordinate_rebuild",
+            "attempt": attempt_number,
+            "home": result,
+        }
+
+    def _execute_full_shot_motion_with_recovery(
+        self,
+        operation,
+        requested_angle,
+        effective_target,
+        target_clamped,
+        speed_rpm=LENS_SPEED_RPM,
+    ):
         if not self.serial or not self.serial.is_open:
             self._invalidate_full_shot_position()
             self.full_shot_last_motion_result = {
                 "ok": False,
                 "reason": "serial_not_open",
-                "operation": "home",
-                "recovered": False,
+                "operation": operation,
+                "requested_angle": requested_angle,
+                "effective_target": effective_target,
+                "recovery_attempts_used": 0,
             }
             return False
 
-        total_attempts = 1 + HOME_RECOVERY_MAX_ATTEMPTS
-        first_failure = None
-
-        for attempt_index in range(total_attempts):
-            recovered = attempt_index > 0
-            attempt_number = attempt_index + 1
-
-            if recovered:
-                print(
-                    f"⚠️ [{self._device_label()}] 首次回零未成功，执行厂商恢复 "
-                    f"{attempt_index}/{HOME_RECOVERY_MAX_ATTEMPTS}: 上电找0 -> 点击回0。"
-                )
-                if not self.send_command(LENS_POWER_ON_HOMING_COMMAND, wait_time=0.5):
-                    self._invalidate_full_shot_position()
-                    self.full_shot_last_motion_result = {
-                        "ok": False,
-                        "reason": "power_on_homing_command_failed",
-                        "operation": "home",
-                        "attempt": attempt_number,
-                        "recovered": False,
-                        "first_failure": first_failure,
-                    }
-                    return False
-                print(
-                    f"⏳ [{self._device_label()}] 厂商恢复：等待 {POWER_ON_HOMING_WAIT:.2f}s "
-                    f"供上电找0完成。"
-                )
-                time.sleep(POWER_ON_HOMING_WAIT)
-
-            print(
-                f"🔙 [{self._device_label()}] full_shot 回零尝试 {attempt_number}/{total_attempts}，"
-                f"正在执行官方【点击回0】指令..."
+        execute_original = (
+            self._execute_home_once
+            if operation == "home"
+            else lambda: self._execute_absolute_move_once(
+                requested_angle,
+                effective_target,
+                target_clamped,
+                speed_rpm,
             )
-            if not self.send_command(LENS_RETURN_HOME_COMMAND, wait_time=0.5):
-                wait_result = {
-                    "ok": False,
-                    "reason": "return_home_command_failed",
-                    "operation": "home",
-                    "status": -1,
-                    "real_angle": None,
-                }
-                self.full_shot_last_wait_result = wait_result
-                stopped, status, real_angle = False, -1, None
-            else:
-                stopped, status, real_angle = self._wait_until_stopped(
-                    timeout_s=HOME_NORMAL_TIMEOUT,
-                    interval_s=POSITION_POLL_INTERVAL,
-                    expected_angle=0.0,
-                    angle_tolerance=HOME_ANGLE_TOLERANCE,
-                    wait_policy=WAIT_POLICY_FULL_SHOT,
-                    normal_timeout_s=HOME_NORMAL_TIMEOUT,
-                    hard_timeout_s=HOME_HARD_TIMEOUT,
-                    operation="home",
-                )
-                wait_result = dict(self.full_shot_last_wait_result or {})
+        )
+        initial_result = execute_original()
+        if initial_result.get("ok"):
+            initial_result.update({
+                "recovered": False,
+                "recovery_attempts_used": 0,
+                "initial_failure": None,
+                "recovery_history": [],
+            })
+            self.full_shot_last_motion_result = initial_result
+            return True
 
-            if stopped:
-                quality = wait_result.get("position_quality", "confirmed")
-                self._update_full_shot_position(real_angle, quality)
-                motion_result = dict(wait_result)
-                motion_result.update({
+        self._invalidate_full_shot_position(initial_result.get("real_angle"))
+        if not self._full_shot_failure_is_recoverable(initial_result.get("reason")):
+            initial_result.update({
+                "recovered": False,
+                "recovery_attempts_used": 0,
+                "initial_failure": dict(initial_result),
+                "recovery_history": [],
+            })
+            self.full_shot_last_motion_result = initial_result
+            return False
+
+        recovery_history = []
+        for attempt_number in range(1, HOME_RECOVERY_MAX_ATTEMPTS + 1):
+            rebuild_result = self._rebuild_coordinate_system_once(attempt_number)
+            history_item = {
+                "attempt": attempt_number,
+                "home": rebuild_result.get("home"),
+                "replay": None,
+                "ok": False,
+                "reason": rebuild_result.get("reason"),
+            }
+            if not rebuild_result.get("ok"):
+                recovery_history.append(history_item)
+                if rebuild_result.get("reason") in {
+                    "power_on_homing_command_failed",
+                    "return_home_command_failed",
+                }:
+                    break
+                continue
+
+            if operation == "home":
+                final_result = dict(rebuild_result.get("home") or {})
+                history_item["ok"] = True
+                history_item["reason"] = "recovered"
+            else:
+                replay_result = self._execute_absolute_move_once(
+                    requested_angle,
+                    effective_target,
+                    target_clamped,
+                    speed_rpm,
+                )
+                history_item["replay"] = replay_result
+                history_item["ok"] = bool(replay_result.get("ok"))
+                history_item["reason"] = (
+                    "recovered" if replay_result.get("ok") else "recovery_replay_failed"
+                )
+                final_result = replay_result
+            recovery_history.append(history_item)
+            if history_item["ok"]:
+                final_result.update({
                     "ok": True,
-                    "operation": "home",
-                    "attempt": attempt_number,
-                    "recovered": recovered,
-                    "first_failure": first_failure,
+                    "recovered": True,
+                    "recovery_attempts_used": attempt_number,
+                    "initial_failure": initial_result,
+                    "recovery_history": recovery_history,
                 })
-                self.full_shot_last_motion_result = motion_result
+                self.full_shot_last_motion_result = final_result
                 print(
-                    f"🎉 [{self._device_label()}] full_shot 回零成功: "
-                    f"status={self._format_status(status)}, 实测={real_angle}°, "
-                    f"position_quality={quality}, recovered={recovered}。"
+                    f"✅ [{self._device_label()}] 坐标系重建 {attempt_number}/"
+                    f"{HOME_RECOVERY_MAX_ATTEMPTS} 后原任务恢复成功。"
                 )
                 return True
 
-            self._invalidate_full_shot_position(real_angle)
-            if first_failure is None:
-                first_failure = wait_result
-            print(
-                f"❌ [{self._device_label()}] full_shot 回零尝试 {attempt_number}/{total_attempts} 失败: "
-                f"reason={wait_result.get('reason')}, "
-                f"status={self._format_status(status)}, 实测={real_angle}°。"
-            )
-
-        final_result = dict(self.full_shot_last_wait_result or {})
-        final_result.update({
+        self._invalidate_full_shot_position()
+        self.full_shot_last_motion_result = {
             "ok": False,
-            "operation": "home",
-            "reason": "home_recovery_failed",
-            "attempt": total_attempts,
+            "reason": "coordinate_recovery_exhausted",
+            "operation": operation,
+            "requested_angle": requested_angle,
+            "effective_target": effective_target,
+            "target_clamped": target_clamped,
             "recovered": False,
-            "first_failure": first_failure,
-        })
-        self.full_shot_last_motion_result = final_result
+            "recovery_attempts_used": len(recovery_history),
+            "initial_failure": initial_result,
+            "recovery_history": recovery_history,
+            "final_wait": dict(self.full_shot_last_wait_result or {}),
+        }
         print(
-            f"❌ [{self._device_label()}] 厂商恢复后仍无法确认回零，镜头应由上层隔离；"
-            f"最后状态={self._format_status(final_result.get('status', -1))}, "
-            f"最后角度={final_result.get('real_angle')}°。"
+            f"❌ [{self._device_label()}] 坐标系重建已用尽，原任务仍失败；"
+            f"上层将隔离该相机，其余相机继续。请检查镜头硬件，"
+            f"或按 Ctrl+C 中断整段任务。"
         )
         return False
 
@@ -792,11 +1024,58 @@ class LensController:
             return False
 
         if wait_policy == WAIT_POLICY_FULL_SHOT:
+            try:
+                requested_angle = float(target_angle_deg)
+            except (TypeError, ValueError):
+                requested_angle = None
+            if (
+                requested_angle is None
+                or not math.isfinite(requested_angle)
+                or not math.isfinite(MOTOR_ANGLE_MIN)
+                or not math.isfinite(MOTOR_ANGLE_MAX)
+                or MOTOR_ANGLE_MIN > MOTOR_ANGLE_MAX
+            ):
+                self._invalidate_full_shot_position()
+                self.full_shot_last_motion_result = {
+                    "ok": False,
+                    "reason": "invalid_motor_angle_configuration",
+                    "operation": "absolute_move",
+                    "requested_angle": requested_angle,
+                    "effective_target": None,
+                    "recovered": False,
+                    "recovery_attempts_used": 0,
+                }
+                print(
+                    f"❌ [{self._device_label()}] 目标角度或电机物理边界非法，"
+                    f"不下发运动指令。"
+                )
+                return False
+
+            effective_target = min(
+                max(requested_angle, MOTOR_ANGLE_MIN),
+                MOTOR_ANGLE_MAX,
+            )
+            target_clamped = effective_target != requested_angle
+            if target_clamped:
+                print(
+                    f"⚠️ [{self._device_label()}] 请求角度越过电机物理边界，"
+                    f"已从 {requested_angle:.2f}° 钳位为 {effective_target:.2f}° "
+                    f"(范围 {MOTOR_ANGLE_MIN:.2f}°~{MOTOR_ANGLE_MAX:.2f}°)。"
+                )
             print(
                 f"🎯 [{self._device_label()}] full_shot 绝对移动请求: "
-                f"目标={target_angle_deg:.2f}°, 当前软件角度={self.current_angle:.2f}°, "
+                f"请求目标={requested_angle:.2f}°, 有效目标={effective_target:.2f}°, "
+                f"当前软件角度={self.current_angle:.2f}°, "
                 f"position_valid={self.full_shot_position_valid}, "
                 f"position_quality={self.full_shot_position_quality}。"
+            )
+            operation = "home" if abs(effective_target - MOTOR_ANGLE_MIN) <= 0.01 else "absolute_move"
+            return self._execute_full_shot_motion_with_recovery(
+                operation=operation,
+                requested_angle=requested_angle,
+                effective_target=effective_target,
+                target_clamped=target_clamped,
+                speed_rpm=speed_rpm,
             )
 
         if abs(target_angle_deg) <= 0.01:

@@ -9,7 +9,7 @@
 - 通过 Modbus TCP 控制 PLC 转台。
 - 根据旋转次数自动计算单次转台角度：`360° / rotations`。
 - 通过串口控制电动镜头寻零、绝对角度移动和回零。
-- 使用工业相机软件触发模式采集并保存 BMP 图片。
+- 使用工业相机软件触发模式采集并保存 JPG 图片。
 - 每个转台阵位支持多个镜头焦段拍摄。
 - 支持多相机和多镜头节点。
 - 按相机名称、阵位和镜头步进组织输出图片。
@@ -225,12 +225,12 @@ python main.py --full_shot `
 ```text
 Output/
 ├── 1/
-│   ├── Position1_Step1.bmp
-│   ├── Position1_Step2.bmp
+│   ├── Position1_Step1.jpg
+│   ├── Position1_Step2.jpg
 │   └── ...
 └── 2/
-    ├── Position1_Step1.bmp
-    ├── Position1_Step2.bmp
+    ├── Position1_Step1.jpg
+    ├── Position1_Step2.jpg
     └── ...
 ```
 
@@ -239,7 +239,7 @@ Output/
 - 第一层目录名是相机 SDK 返回的当前相机名，例如 `1`、`2`。
 - `Position{i}` 表示第 `i` 个转台阵位。
 - `Step{j}` 表示该阵位的第 `j` 个镜头步进。
-- 图片格式保持为 BMP。
+- 图片格式保持为 JPG。
 
 每次正式拍摄前，程序会清空本次选定的图片输出根目录，然后在其中重新创建相机子目录。该清理在一轮任务中只执行一次，不会在阵位或镜头步进之间重复执行。
 
@@ -248,8 +248,8 @@ Output/
 自定义输出示例 `--output_path C://results` 会生成：
 
 ```text
-C://results/1/Position1_Step1.bmp
-C://results/2/Position1_Step1.bmp
+C://results/1/Position1_Step1.jpg
+C://results/2/Position1_Step1.jpg
 ```
 
 ## PLC 寄存器与线圈
