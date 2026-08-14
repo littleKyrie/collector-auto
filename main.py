@@ -37,6 +37,7 @@ DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "configs", "lens_range_map.json
 LENS_RANGE_MAP_PATH = os.path.join("configs", "lens_range_map.json")
 FOCAL_CALI_LOG_DIR = os.path.join("log", "focal_cali")
 FULL_SHOT_LOG_DIR = os.path.join("log", "full_shot")
+FULL_SHOT_SAVE_METADATA_DEFAULT = False
 
 # Constant tolerances
 ANGLE_VERIFY_TOLERANCE = 5.0
@@ -181,6 +182,48 @@ def prepare_output_directory(output_root, project_root=PROJECT_ROOT, config_path
 def metadata_path(path):
     """将实际路径转换为适合写入 JSON metadata 的稳定形式。"""
     return os.path.normpath(path).replace("\\", "/")
+
+
+def write_full_shot_metadata(path, data, position=None, step=None):
+    """原子写入 full_shot metadata；失败时只告警，不中断拍摄。"""
+    temp_path = None
+    try:
+        # 先在内存中完成序列化，提前发现循环引用或不可编码对象，
+        # 避免直接打开正式文件后留下半截 JSON。
+        serialized = json.dumps(data, ensure_ascii=False, indent=2)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".full_shot_metadata_",
+            suffix=".tmp",
+            dir=parent or ".",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(serialized)
+            temp_file.flush()
+
+        os.replace(temp_path, path)
+        temp_path = None
+        return True
+    except (TypeError, ValueError, OSError, UnicodeError) as exc:
+        message = (
+            "full_shot metadata 保存失败，拍摄和转台将继续: "
+            f"position={position}, step={step}, path={path}, error={exc}"
+        )
+        logger.warning(message)
+        print(f"⚠️ {message}")
+        return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def load_full_shot_lens_range_map(config_path):
@@ -458,6 +501,7 @@ def build_full_shot_parser():
   python main.py --full_shot --host 192.168.1.100 --lens-steps 3
   python main.py --full_shot --error-continue-model 0 --error-signal false
   python main.py --full_shot --output_path C://results --config_path C://camera-configs/lens_range_map.json
+  python main.py --full_shot --save_metadata
 
 镜头范围:
   默认读取项目根目录下的 configs/lens_range_map.json，也可通过 --config_path 指定配置文件。
@@ -469,7 +513,9 @@ def build_full_shot_parser():
   图片默认输出到项目根目录下的 Output/{camera.user_id}/Position{i}_Step{j}.jpg。
   可通过 --output_path 指定图片输出根目录。
   正式拍摄前会清空所选图片输出根目录中的全部旧内容。
-  每个 step 的相机目标角度写入 log/full_shot/{run_timestamp}/Position{i}_Step{j}_metadata.json。
+  默认只保存 JPG，不写入 full-shot metadata JSON。
+  使用 --save_metadata 后，每个 step 的诊断信息写入
+  log/full_shot/{run_timestamp}/Position{i}_Step{j}_metadata.json。
 
 寄存器说明:
   D300: 间隔运行角度 (值=角度×100)
@@ -556,6 +602,13 @@ def build_full_shot_parser():
         type=str,
         default=DEFAULT_CONFIG_PATH,
         help='镜头范围配置文件 (默认: 项目根目录/configs/lens_range_map.json)'
+    )
+
+    parser.add_argument(
+        '--save_metadata',
+        action='store_true',
+        default=FULL_SHOT_SAVE_METADATA_DEFAULT,
+        help='保存逐阵位、逐步进的 full-shot 调试 metadata JSON (默认: 不保存)'
     )
 
     # For lens control
@@ -1126,6 +1179,11 @@ def run_rotation_multi_shot(args):
     try:
         output_root = resolve_project_path(getattr(args, "output_path", DEFAULT_OUTPUT_PATH))
         config_path = resolve_project_path(getattr(args, "config_path", DEFAULT_CONFIG_PATH))
+        save_metadata = bool(getattr(
+            args,
+            "save_metadata",
+            FULL_SHOT_SAVE_METADATA_DEFAULT,
+        ))
         output_root = validate_output_directory_path(
             output_root,
             project_root=PROJECT_ROOT,
@@ -1187,15 +1245,16 @@ def run_rotation_multi_shot(args):
         # =========================================
         # 步骤三：定义回调函数 (直接定义在模式2内部访问局部变量)
         # =========================================
-        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        command_log_dir = FULL_SHOT_LOG_DIR
-        run_log_dir = os.path.join(command_log_dir, run_timestamp)
-        os.makedirs(run_log_dir, exist_ok=True)
-        image_path_pattern = metadata_path(os.path.join(
-            output_root,
-            "{camera_user_id}",
-            "Position{i}_Step{j}.jpg",
-        ))
+        run_log_dir = None
+        image_path_pattern = None
+        if save_metadata:
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_log_dir = os.path.join(FULL_SHOT_LOG_DIR, run_timestamp)
+            image_path_pattern = metadata_path(os.path.join(
+                output_root,
+                "{camera_user_id}",
+                "Position{i}_Step{j}.jpg",
+            ))
 
         def normalize_operation_summary(summary, default_successful=None):
             if isinstance(summary, dict):
@@ -1213,7 +1272,7 @@ def run_rotation_multi_shot(args):
             print("="*55)
 
             # 执行相机变焦与拍摄逻辑
-            position_metadata_paths = []
+            position_metadata_entries = []
             for step_idx in range(args.lens_steps):
                 target_angles_by_camera = {
                     cam_name: step_angles[step_idx]
@@ -1246,13 +1305,13 @@ def run_rotation_multi_shot(args):
                     default_successful=successful_cameras,
                 )
 
-                # 镜头停稳后拍照；图片按相机目录保存，step metadata 写入 log
-                os.makedirs(run_log_dir, exist_ok=True)
-                metadata_file_path = os.path.join(
-                    run_log_dir,
-                    f"Position{current}_Step{step_idx + 1}_metadata.json",
-                )
-                step_metadata = {
+                # metadata 仅在显式开启时持久化，不参与镜头或转台控制。
+                if save_metadata:
+                    metadata_file_path = os.path.join(
+                        run_log_dir,
+                        f"Position{current}_Step{step_idx + 1}_metadata.json",
+                    )
+                    step_metadata = {
                         "position": current,
                         "step_index": step_idx + 1,
                         "lens_steps": args.lens_steps,
@@ -1271,9 +1330,15 @@ def run_rotation_multi_shot(args):
                         "image_path_pattern": image_path_pattern,
                         "generated_at": timestamp(),
                     }
-                with open(metadata_file_path, "w", encoding="utf-8") as f:
-                    json.dump(step_metadata, f, ensure_ascii=False, indent=2)
-                position_metadata_paths.append(metadata_file_path)
+                    if write_full_shot_metadata(
+                        metadata_file_path,
+                        step_metadata,
+                        position=current,
+                        step=step_idx + 1,
+                    ):
+                        position_metadata_entries.append(
+                            (metadata_file_path, step_metadata)
+                        )
 
             # 拍摄完毕，镜头平滑退回初始 0 点
             print(f"\n 🔙 第 {current} 阵位拍摄完毕，镜头正在复位...")
@@ -1286,14 +1351,16 @@ def run_rotation_multi_shot(args):
                 )
             )
 
-            if position_metadata_paths:
-                metadata_file_path = position_metadata_paths[-1]
-                with open(metadata_file_path, "r", encoding="utf-8") as f:
-                    last_step_metadata = json.load(f)
+            if save_metadata and position_metadata_entries:
+                metadata_file_path, last_step_metadata = position_metadata_entries[-1]
                 last_step_metadata["home_summary"] = home_summary
                 last_step_metadata["camera_status_after_home"] = sys_dev.get_full_shot_status()
-                with open(metadata_file_path, "w", encoding="utf-8") as f:
-                    json.dump(last_step_metadata, f, ensure_ascii=False, indent=2)
+                write_full_shot_metadata(
+                    metadata_file_path,
+                    last_step_metadata,
+                    position=current,
+                    step="home",
+                )
 
             if home_summary.get("failed"):
                 print(
@@ -1333,6 +1400,7 @@ def run_rotation_multi_shot(args):
         print(f"屏蔽红外信号: {args.error_signal}")
         print(f"图片输出目录: {output_root}")
         print(f"镜头配置文件: {config_path}")
+        print(f"full-shot metadata: {'保存' if save_metadata else '不保存'}")
         error_modes = {0: "继续运行", 1: "回到起始位置", 2: "默认"}
         print(f"异常处理模式: {error_modes.get(args.error_continue_model, '未知')}")
         print("=" * 60)

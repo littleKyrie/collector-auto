@@ -33,6 +33,12 @@ class FullShotArgumentTests(unittest.TestCase):
 
         self.assertEqual(args.output_path, main.DEFAULT_OUTPUT_PATH)
         self.assertEqual(args.config_path, main.DEFAULT_CONFIG_PATH)
+        self.assertFalse(args.save_metadata)
+
+    def test_save_metadata_is_explicitly_enabled(self):
+        args = main.parse_args(["--save_metadata"])
+
+        self.assertTrue(args.save_metadata)
 
     def test_relative_paths_are_resolved_from_project_root(self):
         args = main.parse_args([
@@ -61,7 +67,15 @@ class FullShotArgumentTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 0)
             self.assertIn("--output_path", output.getvalue())
             self.assertIn("--config_path", output.getvalue())
+            self.assertIn("--save_metadata", output.getvalue())
             self.assertFalse(os.path.exists(output_path))
+
+    def test_focus_calibration_does_not_accept_full_shot_metadata_flag(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = main.handle_focus_calibration_cli(["--save_metadata"])
+
+        self.assertEqual(result, 2)
+        self.assertIn("未知参数", output.getvalue())
 
 
 class OutputDirectoryTests(unittest.TestCase):
@@ -212,6 +226,46 @@ class FullShotConfigTests(unittest.TestCase):
                 main.load_full_shot_lens_range_map(config_path)
 
 
+class FullShotMetadataTests(unittest.TestCase):
+    def test_metadata_writer_rejects_circular_data_without_partial_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metadata_path = os.path.join(temp_dir, "run", "metadata.json")
+            circular = {}
+            circular["self"] = circular
+
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                written = main.write_full_shot_metadata(
+                    metadata_path,
+                    circular,
+                    position=13,
+                    step=1,
+                )
+
+            self.assertFalse(written)
+            self.assertFalse(os.path.exists(metadata_path))
+            self.assertFalse(os.path.exists(os.path.dirname(metadata_path)))
+            self.assertIn("拍摄和转台将继续", output.getvalue())
+
+    def test_metadata_replace_failure_is_non_fatal_and_cleans_temp_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            main.os,
+            "replace",
+            side_effect=OSError("replace denied"),
+        ), contextlib.redirect_stdout(io.StringIO()) as output:
+            metadata_path = os.path.join(temp_dir, "metadata.json")
+            written = main.write_full_shot_metadata(
+                metadata_path,
+                {"ok": True},
+                position=1,
+                step="home",
+            )
+
+            self.assertFalse(written)
+            self.assertFalse(os.path.exists(metadata_path))
+            self.assertEqual(os.listdir(temp_dir), [])
+            self.assertIn("replace denied", output.getvalue())
+
+
 class FullShotIntegrationTests(unittest.TestCase):
     def test_custom_paths_are_used_and_output_is_cleared_only_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -287,6 +341,21 @@ class FullShotIntegrationTests(unittest.TestCase):
                             "port": "COM7",
                             "enabled": True,
                             "position_quality": "confirmed",
+                            "last_motion_result": {
+                                "ok": True,
+                                "recovered": True,
+                                "recovery_attempts_used": 1,
+                                "initial_failure": {
+                                    "reason": "stopped_position_mismatch",
+                                    "real_angle": 0.0,
+                                },
+                                "recovery_history": [{
+                                    "attempt": 1,
+                                    "home": {"ok": True, "real_angle": 0.1},
+                                    "replay": {"ok": True, "real_angle": 100.0},
+                                    "ok": True,
+                                }],
+                            },
                         }
                     }
 
@@ -330,6 +399,7 @@ class FullShotIntegrationTests(unittest.TestCase):
                 delay=0.0,
                 error_signal=True,
                 error_continue_model=2,
+                save_metadata=True,
             )
 
             with mock.patch.dict(sys.modules, {"ImageNode": image_node_stub}), mock.patch.object(
@@ -358,6 +428,154 @@ class FullShotIntegrationTests(unittest.TestCase):
                     "Position{i}_Step{j}.jpg",
                 )),
             )
+            self.assertIn("home_summary", metadata)
+            saved_motion = metadata["camera_status"]["1"]["last_motion_result"]
+            self.assertTrue(saved_motion["recovered"])
+            self.assertEqual(saved_motion["recovery_attempts_used"], 1)
+            self.assertEqual(
+                saved_motion["recovery_history"][0]["replay"]["real_angle"],
+                100.0,
+            )
+
+            disabled_output_path = os.path.join(temp_dir, "results-without-metadata")
+            disabled_log_path = os.path.join(temp_dir, "logs-disabled")
+            args.output_path = disabled_output_path
+            args.save_metadata = False
+
+            with mock.patch.dict(sys.modules, {"ImageNode": image_node_stub}), mock.patch.object(
+                main, "ModbusClient", Client
+            ), mock.patch.object(
+                main, "RotationController", Controller
+            ), mock.patch.object(
+                main, "FULL_SHOT_LOG_DIR", disabled_log_path
+            ), contextlib.redirect_stdout(io.StringIO()):
+                disabled_result = main.run_rotation_multi_shot(args)
+
+            self.assertEqual(disabled_result, 0)
+            self.assertTrue(os.path.isfile(os.path.join(
+                disabled_output_path,
+                "1",
+                "Position2_Step1.jpg",
+            )))
+            self.assertFalse(os.path.exists(disabled_log_path))
+
+    def test_metadata_write_failure_does_not_abort_rotation_sequence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "results")
+            config_path = os.path.join(temp_dir, "lens.json")
+            Path(config_path).write_text(
+                json.dumps({
+                    "lens_ranges": {
+                        "1": {
+                            "calibrated": True,
+                            "angle_start": 0.0,
+                            "angle_end": 0.0,
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+
+            class Camera:
+                m_userId = "1"
+
+            class Node:
+                camera = Camera()
+
+            class ImagingSystem:
+                def __init__(self, lens_coordinate_mode):
+                    self.nodes = [Node()]
+
+                def init_system(self):
+                    pass
+
+                def open_all(self):
+                    pass
+
+                def parallel_global_homing(self):
+                    pass
+
+                def parallel_move_lenses_by_camera(self, target_angles, **kwargs):
+                    return {
+                        "ok": True,
+                        "successful": ["1"],
+                        "failed": {},
+                        "skipped": [],
+                    }
+
+                def parallel_move_lenses(self, target_angle, **kwargs):
+                    return {
+                        "ok": True,
+                        "successful": ["1"],
+                        "failed": {},
+                        "skipped": [],
+                    }
+
+                def parallel_snap_rotation_step(self, *args, **kwargs):
+                    return {
+                        "ok": True,
+                        "successful": ["1"],
+                        "failed": {},
+                        "skipped": [],
+                    }
+
+                def get_full_shot_status(self):
+                    return {"1": {"enabled": True}}
+
+                def close_all(self):
+                    pass
+
+            class Client:
+                def __init__(self, host, port):
+                    pass
+
+                def connect(self):
+                    return True
+
+                def disconnect(self):
+                    pass
+
+            class Controller:
+                def __init__(self, client):
+                    pass
+
+                def validate_parameters(self, rotations, speed, delay):
+                    return True, ""
+
+                def run_rotation_sequence(self, **kwargs):
+                    kwargs["progress_callback"](1, 1)
+                    return True
+
+            args = SimpleNamespace(
+                output_path=output_path,
+                config_path=config_path,
+                lens_coordinate_mode="software",
+                lens_steps=1,
+                host="127.0.0.1",
+                port=502,
+                rotations=1,
+                speed=5.0,
+                delay=0.0,
+                error_signal=True,
+                error_continue_model=2,
+                save_metadata=True,
+            )
+            image_node_stub = types.ModuleType("ImageNode")
+            image_node_stub.ImagingSystem = ImagingSystem
+
+            with mock.patch.dict(sys.modules, {"ImageNode": image_node_stub}), mock.patch.object(
+                main, "ModbusClient", Client
+            ), mock.patch.object(
+                main, "RotationController", Controller
+            ), mock.patch.object(
+                main,
+                "write_full_shot_metadata",
+                return_value=False,
+            ) as write_metadata, contextlib.redirect_stdout(io.StringIO()):
+                result = main.run_rotation_multi_shot(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(write_metadata.call_count, 1)
 
 
 if __name__ == "__main__":

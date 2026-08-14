@@ -200,6 +200,14 @@ python main.py --full_shot `
   --config_path C://camera-configs/lens_range_map.json
 ```
 
+如需保存逐阵位、逐步进的 full-shot 调试 metadata：
+
+```powershell
+python main.py --full_shot --save_metadata
+```
+
+默认只保存 JPG 和控制台日志，不写入 `Position*_Step*_metadata.json`。
+
 ### 命令行参数
 
 | 参数 | 缩写 | 默认值 | 说明 |
@@ -214,6 +222,7 @@ python main.py --full_shot `
 | `--error-continue-model` | - | `2` | PLC 异常处理模式：0=继续，1=复位，2=默认 |
 | `--output_path` | - | 项目根目录下的 `Output` | 图片输出根目录；正式拍摄前清空其中的旧内容 |
 | `--config_path` | - | 项目根目录下的 `configs/lens_range_map.json` | 本次拍摄读取的镜头范围配置文件 |
+| `--save_metadata` | - | 关闭 | 保存逐阵位、逐步进的 full-shot 调试 metadata JSON |
 | `--verbose` | `-v` | 关闭 | 输出详细日志 |
 
 相对形式的 `output_path` 和 `config_path` 都以项目根目录为基准解析。`config_path` 是具体 JSON 文件路径，不是目录路径。
