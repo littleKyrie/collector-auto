@@ -1,3 +1,4 @@
+import copy
 import serial
 import math
 import struct
@@ -1079,12 +1080,15 @@ class LensController:
                     target_clamped,
                     speed_rpm,
                 )
-                history_item["replay"] = replay_result
+                # 保存独立快照，避免恢复成功后 final_result.recovery_history
+                # 通过 history_item["replay"] 再指回 final_result 自身。
+                # metadata 需要保留每次原任务重试详情，但必须保持 JSON 可序列化。
+                history_item["replay"] = copy.deepcopy(replay_result)
                 history_item["ok"] = bool(replay_result.get("ok"))
                 history_item["reason"] = (
                     "recovered" if replay_result.get("ok") else "recovery_replay_failed"
                 )
-                final_result = replay_result
+                final_result = copy.deepcopy(replay_result)
             recovery_history.append(history_item)
             if history_item["ok"]:
                 final_result.update({

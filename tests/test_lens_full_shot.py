@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import sys
 import types
 import unittest
@@ -257,6 +258,79 @@ class FullShotRecoveryTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(rebuild.call_count, 2)
         self.assertEqual(lens.full_shot_last_motion_result["recovery_attempts_used"], 2)
+
+    def test_recovery_result_keeps_retry_details_and_is_json_serializable(self):
+        lens = self.make_open_lens()
+        first_replay_failure = self.failed_move("timeout_still_moving")
+        final_replay_success = self.successful_move()
+        with mock.patch.object(
+            lens,
+            "_execute_absolute_move_once",
+            side_effect=[
+                self.failed_move(),
+                first_replay_failure,
+                final_replay_success,
+            ],
+        ), mock.patch.object(
+            lens,
+            "_rebuild_coordinate_system_once",
+            side_effect=[
+                {
+                    "ok": True,
+                    "reason": "coordinate_rebuild_succeeded",
+                    "home": {
+                        "ok": True,
+                        "reason": "confirmed_stopped_at_target",
+                        "status": 0x00,
+                        "real_angle": 0.1,
+                    },
+                },
+                {
+                    "ok": True,
+                    "reason": "coordinate_rebuild_succeeded",
+                    "home": {
+                        "ok": True,
+                        "reason": "confirmed_stopped_at_target",
+                        "status": 0x00,
+                        "real_angle": 0.2,
+                    },
+                },
+            ],
+        ), contextlib.redirect_stdout(io.StringIO()):
+            ok = lens.move_to_absolute_angle(
+                1700.0,
+                wait_policy=WAIT_POLICY_FULL_SHOT,
+            )
+
+        result = lens.full_shot_last_motion_result
+        payload = json.loads(json.dumps({
+            "camera_status": {
+                "1": {"last_motion_result": result},
+            },
+        }))
+        saved_result = payload["camera_status"]["1"]["last_motion_result"]
+
+        self.assertTrue(ok)
+        self.assertTrue(saved_result["recovered"])
+        self.assertEqual(saved_result["recovery_attempts_used"], 2)
+        self.assertEqual(saved_result["initial_failure"]["reason"], "stopped_position_mismatch")
+        self.assertEqual(len(saved_result["recovery_history"]), 2)
+        self.assertEqual(
+            saved_result["recovery_history"][0]["replay"]["reason"],
+            "timeout_still_moving",
+        )
+        self.assertEqual(
+            saved_result["recovery_history"][1]["home"]["real_angle"],
+            0.2,
+        )
+        self.assertEqual(
+            saved_result["recovery_history"][1]["replay"]["real_angle"],
+            1700.0,
+        )
+        self.assertIsNot(
+            result,
+            result["recovery_history"][1]["replay"],
+        )
 
     def test_recovery_budget_resets_for_each_new_motion(self):
         lens = self.make_open_lens()
