@@ -2,10 +2,11 @@
 
 ## 1. 改造目标
 
-本计划只调整 `--full_shot` 模式，为其增加两个命令行参数：
+本计划只调整 `--full_shot` 模式，为其增加三个命令行参数：
 
 - `--output_path`：指定本次拍摄的图片输出根目录。
 - `--config_path`：指定本次拍摄读取的镜头范围配置文件。
+- `--save_metadata`：可选保存逐阵位、逐步进的 full-shot 调试 metadata；默认关闭。
 
 同时改变图片输出目录的初始化规则：每次 `full_shot` 正式开始写入图片前，都要先清空本次选定的输出目录，避免旧图片残留，也不再依赖同名文件覆盖。
 
@@ -112,17 +113,50 @@ python main.py --full_shot --config_path C://camera-configs/lens_range_map.json
 
 该参数只影响 `full_shot`。`--focus_calibration` 继续使用其现有配置路径和交互流程，本次不扩展其参数。
 
-### 3.3 完整示例
+### 3.3 `--save_metadata`
+
+参数定义：
+
+```text
+--save_metadata
+```
+
+该参数使用 `argparse` 的 `action="store_true"`：未提供时 `args.save_metadata=False`，提供后为 `True`。它是专用于 `full_shot` 的诊断记录开关，不使用含义过宽的 `--debug`，避免以后将控制台日志级别、串口报文调试和 metadata 输出混成同一个功能。
+
+语义：
+
+- 默认不创建 full-shot metadata 运行目录，不生成、写入或回读任何 `Position*_Step*_metadata.json`。
+- 默认关闭只影响外部 metadata JSON；JPG 图片、控制台日志、镜头异常检测、坐标系重建、相机隔离和最终控制台汇总保持不变。
+- `lens_range_map.json` 是拍摄输入配置，仍按 `--config_path` 正常读取；“不写入外部 JSON”不表示禁用配置文件读取。
+- 开启后沿用逐阵位、逐步进 metadata，并保存移动、拍照、回零、恢复重试和相机隔离等结构化结果。
+- 该参数不加入 `focus_calibration`，也不改变 legacy 调用链。
+
+示例：
+
+```powershell
+python main.py --full_shot --save_metadata
+```
+
+如项目需要一个集中默认值，可以定义：
+
+```python
+FULL_SHOT_SAVE_METADATA_DEFAULT = False
+```
+
+但运行时判断必须统一落到 `args.save_metadata`，不能同时在回调函数中直接读取全局变量，避免命令行值与全局值不一致。
+
+### 3.4 完整示例
 
 ```powershell
 python main.py --full_shot `
   --output_path C://results `
   --config_path C://camera-configs/lens_range_map.json `
+  --save_metadata `
   --rotations 12 `
   --lens-steps 5
 ```
 
-`--full_shot --help` 中应展示两个参数的用途、默认值和路径解析规则。执行帮助命令不得创建、读取或清空任何业务目录。
+`--full_shot --help` 中应展示三个参数的用途和默认行为，并展示两个路径参数的解析规则。执行帮助命令不得创建、读取或清空任何业务目录。
 
 ## 4. 输出目录清理设计
 
@@ -245,7 +279,7 @@ output_root = args.output_path
 
 在进入 `run_rotation_sequence()` 前调用一次 `prepare_output_directory()`。`ImageNode.py` 的两个 rotation step 保存函数已经接收 `output_root`，因此预计无需修改其图片目录生成逻辑。
 
-### 5.6 同步 metadata
+### 5.6 开启保存时同步 metadata
 
 当前 step metadata 中有两个硬编码字段：
 
@@ -265,7 +299,7 @@ output_root = args.output_path
 }
 ```
 
-路径字段应使用统一的字符串转换方式，避免 Windows 分隔符在日志和 JSON 中表现不一致。
+仅当 `args.save_metadata=True` 时构造和写入上述内容。路径字段应使用统一的字符串转换方式，避免 Windows 分隔符在日志和 JSON 中表现不一致。
 
 ### 5.7 更新用户文档
 
@@ -284,7 +318,7 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 
 - `main.py`
   - 新增路径默认值、解析/校验和输出目录准备函数。
-  - 新增两个 CLI 参数。
+  - 新增三个 CLI 参数。
   - 使用动态输出路径和配置路径。
   - 同步帮助与 metadata。
 - `README.md`
@@ -298,8 +332,8 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 
 ### 7.1 参数解析
 
-- `python main.py --full_shot --help` 能看到 `--output_path` 和 `--config_path`。
-- 两个参数都省略时，解析结果分别为项目根目录下的 `Output` 和 `configs/lens_range_map.json`。
+- `python main.py --full_shot --help` 能看到 `--output_path`、`--config_path` 和 `--save_metadata`。
+- 两个路径参数都省略时，解析结果分别为项目根目录下的 `Output` 和 `configs/lens_range_map.json`；`save_metadata` 默认为 `False`。
 - 相对路径基于项目根目录解析，不受启动命令当前目录影响。
 - 包含空格、中文和 Windows 正反斜杠的路径可被正确解析。
 - 未知参数仍由 `argparse` 拒绝。
@@ -335,26 +369,28 @@ README 中现有图片目录示例与当前代码已经不一致，更新时应�
 - 运行前遗留文件已全部清除，不只覆盖同名图片。
 - 输出目录在整轮任务中仅清理一次，多阵位和多 step 图片不会互相清除。
 - 指定自定义输出目录时，默认 `Output` 不会被创建或清理。
-- metadata 中的配置路径和图片路径模式与实际参数一致。
+- 开启 `--save_metadata` 时，metadata 中的配置路径和图片路径模式与实际参数一致。
+- 未开启 `--save_metadata` 时，不创建 metadata 运行目录，也不生成任何 step metadata JSON。
 - `--full_shot --help` 不初始化硬件，不读取配置，也不清空输出目录。
 
 ## 8. 验收标准
 
 - [ ] `full_shot` 支持 `--output_path`，默认行为仍输出到项目根目录 `Output`。
 - [ ] `full_shot` 支持 `--config_path`，默认行为仍读取项目根目录 `configs/lens_range_map.json`。
+- [ ] `full_shot` 支持 `--save_metadata`，默认关闭；关闭时不产生外部 metadata JSON。
 - [ ] 自定义输出目录下按当前相机名建立 `1/`、`2/` 等子目录。
 - [ ] 每次正式拍摄前只清理一次所选输出根目录的旧内容。
 - [ ] 清理失败或目标路径危险时不会启动拍摄。
 - [ ] 自定义配置路径不会静默回退到默认配置文件。
 - [ ] 图片命名和 JPG 格式保持不变。
-- [ ] step metadata 记录本次运行真实使用的配置路径和输出路径。
+- [ ] 开启 `--save_metadata` 时，step metadata 记录本次运行真实使用的配置路径和输出路径。
 - [ ] `focus_calibration` 的现有配置读写行为不受影响。
 - [ ] 帮助命令无文件系统和硬件副作用。
 
 ## 9. 实施顺序
 
 1. 增加 `PROJECT_ROOT`、默认路径常量和路径解析函数。
-2. 为 `build_full_shot_parser()` 增加两个参数并更新帮助文本。
+2. 为 `build_full_shot_parser()` 增加三个参数并更新帮助文本。
 3. 增加输出目录安全校验和一次性清理函数。
 4. 在 `run_rotation_multi_shot()` 中接入 `args.config_path`。
 5. 在正式旋转序列开始前接入 `args.output_path` 的一次性准备逻辑。
@@ -886,7 +922,7 @@ self.failed_at_step = None
 3. 其余相机正常拍照，转台流程继续。
 4. “所有镜头均已同步到位”只能在全部活动镜头成功时输出。
 5. 存在失败时输出“部分镜头到位，已隔离 N 台，其余继续”，不能再输出全成功文案。
-6. 每个 step 的 metadata 增加活动相机、跳过相机、各镜头移动结果、位置质量和隔离原因，便于后续识别缺图及异常图。
+6. 开启 `--save_metadata` 时，每个 step 的 metadata 增加活动相机、跳过相机、各镜头移动结果、位置质量和隔离原因，便于后续识别缺图及异常图。
 
 ### 10.9 日志规范
 
@@ -937,7 +973,7 @@ self.failed_at_step = None
 - `main.py`
   - `full_shot` 根据移动汇总只拍摄成功相机，不因单相机失败终止整个循环。
   - 任一 full-shot 镜头运动在坐标重建次数用尽后隔离对应相机，其余相机和转台继续。
-  - step metadata 记录镜头状态、跳过原因和位置质量。
+  - 开启 `--save_metadata` 时，step metadata 记录镜头状态、跳过原因和位置质量；默认关闭时不创建对应 JSON。
   - 保持 `KeyboardInterrupt` 可由用户主动中止整段任务。
 
 - 测试文件
@@ -969,7 +1005,7 @@ self.failed_at_step = None
 22. **启动初始化不占预算**：full-shot 启动阶段既有的上电找 0 和回零不影响任何后续阵位失败事件的恢复次数。
 23. **软件坐标失效**：初始失败后 `full_shot_position_valid=False`；即使旧 `current_angle` 与目标之差小于 `0.1°`，也不得快捷返回，更不能用一次角度读取重新设为有效。只有完整坐标重建验证成功后才能恢复有效。
 24. **不可恢复错误**：非法物理边界配置或串口写失败不进行无意义坐标重建，返回明确原因并隔离；`KeyboardInterrupt` 不得被转成隔离结果。
-25. **并发部分失败**：四台相机中一台恢复用尽，另外三台仍移动和拍照；失败相机不生成本阵位图片，并写入 metadata。
+25. **并发部分失败**：四台相机中一台恢复用尽，另外三台仍移动和拍照；失败相机不生成本阵位图片；开启 `--save_metadata` 时同时写入对应 metadata。
 26. **拍照失败隔离**：某相机拍照抛异常后被隔离，其余相机和转台继续。
 27. **用户中断**：任意等待或恢复阶段按 `Ctrl+C`，`KeyboardInterrupt` 正常向上传播并执行既有资源清理。
 28. **焦距标定零改动兼容**：确认 `focus_calibration` 中 `initialize_lens()`、`return_to_home()`、`move_relative_for_calibration()` 和 `_wait_until_stopped()` 的调用代码段不增加新参数；现有返回结构、边界识别、交互输出和配置结果不变。
@@ -987,9 +1023,123 @@ self.failed_at_step = None
 7. 实现带恢复次数上限的 full-shot 运动协调器：初始任务失败后执行坐标重建；普通移动在回零成功后重新计算相对角度并重放原有效目标。
 8. 明确 `HOME_RECOVERY_MAX_ATTEMPTS` 是“每台相机、每次原始运动失败事件”的局部预算；使用协调器局部变量计数，并以测试保证不在 home/move 层重复嵌套、不跨阵位累计、相机间互不影响。
 9. 更新软件坐标有效性规则：初始失败立即失效，只有恢复及原任务最终验证成功后恢复有效；小位移快捷返回必须先验证。
-10. 保持 `ImageNode.py` 当前并发结果传播、相机隔离和拍照过滤机制，并扩展 motion result/metadata 记录恢复历史。
-11. 保持 `main.py` 的持续运行、metadata 异常记录和最终隔离汇总，更新控制台日志文案以区分初始失败、恢复中和恢复用尽。
+10. 保持 `ImageNode.py` 当前并发结果传播、相机隔离和拍照过滤机制，并扩展 motion result；仅在开启 `--save_metadata` 时持久化恢复历史。
+11. 保持 `main.py` 的持续运行和最终隔离汇总；metadata 默认关闭，开启后的写入异常只告警、不终止旋转；更新控制台日志文案以区分初始失败、恢复中和恢复用尽。
 12. 增加 mock 状态序列测试，覆盖 10.11 中全部非硬件场景和接口隔离检查。
 13. 为 `initialize_lens()` 增加默认 legacy/full-shot 双策略；让 `parallel_global_homing()` 显式使用增强初始化，并测试首次稳定成功、恢复成功和恢复用尽隔离。
 14. 回归执行现有 `focus_calibration`，确认调用代码段、交互、等待语义和标定结果零行为变化。
 15. 使用真实镜头调节顶部阈值，验证初始化与普通移动的 `0xFF` 稳定、`0xF5`/`0x0B` 边界、两轮坐标重建以及单相机隔离行为。
+
+## 11. full-shot metadata 可选保存计划
+
+### 11.1 目标与默认行为
+
+full-shot 的 `Position*_Step*_metadata.json` 定位为诊断和事后追踪文件，不参与镜头移动、拍照、坐标系重建、相机隔离或 PLC 转台控制。新增 `--save_metadata` 后采用以下默认策略：
+
+```text
+未传 --save_metadata：只保存 JPG，不写 metadata JSON（默认）
+传入 --save_metadata：保存 JPG，并写逐 step metadata JSON
+```
+
+关闭 metadata 时仍保留控制台日志。所有结构化运动结果仍可在内存中用于本轮判断和相机隔离，只是不再持久化到外部 JSON。
+
+### 11.2 参数接入
+
+在 `build_full_shot_parser()` 中增加：
+
+```python
+parser.add_argument(
+    "--save_metadata",
+    action="store_true",
+    default=FULL_SHOT_SAVE_METADATA_DEFAULT,
+    help="保存逐阵位、逐步进的 full-shot 调试 metadata JSON（默认不保存）",
+)
+```
+
+要求：
+
+1. 只注册到 full-shot 参数解析器，`focus_calibration` 不增加该参数。
+2. `handle_full_shot_cli()` 将解析结果原样传入 `run_rotation_multi_shot(args)`。
+3. 拍摄回调只读取 `args.save_metadata`，不在各层重复解析环境变量或全局开关。
+4. PyInstaller 打包无需额外 `--hidden-import` 或 `--add-data`；该功能只是普通布尔参数。
+
+### 11.3 关闭时必须跳过的操作
+
+当前 metadata 路径和运行目录不能在回调外无条件创建。未开启 `--save_metadata` 时必须跳过：
+
+1. 生成仅供 metadata 使用的 `run_timestamp` 和对应运行目录。
+2. 调用 `os.makedirs(run_log_dir, exist_ok=True)`。
+3. 构造完整 `step_metadata`；尤其不要仅为写盘调用 `get_full_shot_status()` 生成大型快照。
+4. 打开和写入 `Position{current}_Step{step}_metadata.json`。
+5. 将 metadata 文件路径加入 `position_metadata_paths`。
+6. 阵位回零后重新打开最后一个 metadata 文件，追加 `home_summary` 和 `camera_status_after_home`。
+
+推荐在 `progress_callback()` 中按单一开关包围完整 metadata 生命周期：
+
+```python
+if args.save_metadata:
+    # 构造并写入 step metadata
+
+# 回零逻辑始终执行，不受 metadata 开关影响
+home_summary = ...
+
+if args.save_metadata and position_metadata_paths:
+    # 追加本阵位回零结果
+```
+
+不得通过提前 `return` 跳过 metadata 来实现关闭功能，否则可能同时跳过镜头复位或转台控制权归还。
+
+### 11.4 开启时的记录内容
+
+开启后，每个 step 至少保留：
+
+- 阵位、step 序号、目标角度和实际图片路径模式；
+- 活动、成功、跳过、失败和已隔离相机；
+- 每台镜头的软件坐标有效性、位置质量、最终状态与实测角度；
+- 拍照结果；
+- 本 step 移动的 `initial_failure`；
+- `recovered`、`recovery_attempts_used`；
+- `recovery_history` 中每一轮独立的 `home` 与 `replay` 快照；
+- 最终运动结果；
+- 阵位结束后的 `home_summary` 和 `camera_status_after_home`；
+- 实际使用的配置路径、图片路径模式和生成时间。
+
+恢复历史必须保留必要诊断细节，但不能保存互相引用的运行中字典。`history_item["replay"]`、最终结果、初始失败和 home 结果应使用彼此独立的数据快照；禁止形成：
+
+```text
+final_result → recovery_history → replay → final_result
+```
+
+写盘前必须通过 `json.dumps(step_metadata, ensure_ascii=False)` 或等价校验确认整个对象可序列化。不要使用 `default=str` 掩盖循环引用或未知对象，因为那会降低 metadata 的结构可靠性。
+
+### 11.5 写入失败的降级策略
+
+metadata 是诊断输出，不应拥有中止生产拍摄的权限。开启保存后，如发生 `TypeError`、`ValueError`、`OSError` 或 JSON 编码失败：
+
+1. 控制台输出 metadata 文件路径、阵位、step 和异常原因。
+2. 标记本次 metadata 保存失败，但不隔离相机。
+3. 不把该异常抛入 `RotationController.run_rotation_sequence()`，避免阻止下一次 `coilResume`。
+4. 镜头复位、JPG 保存和转台后续阵位继续执行。
+5. 建议先序列化到内存或同目录临时文件，成功后再替换正式文件，避免留下半截 JSON。
+
+该降级仅适用于 metadata 诊断文件；图片保存失败、镜头恢复用尽和 PLC 错误仍按各自已有策略处理。
+
+### 11.6 验证计划
+
+1. **默认关闭**：不传 `--save_metadata` 完成多个阵位拍摄，只存在 JPG，不创建 full-shot metadata 运行目录。
+2. **显式开启**：传入 `--save_metadata` 后，每个阵位/step 生成对应 JSON，并在最后一个 step 中追加回零摘要。
+3. **恢复详情**：模拟“初始移动失败 → 第一次重放失败 → 第二次恢复成功”，JSON 中完整保留两轮 home/replay，且 `json.dumps()` 不出现循环引用。
+4. **回零恢复详情**：阵位结束回零触发坐标重建时，最后一个 step metadata 正确保存恢复次数和最终角度。
+5. **写入失败不中断**：模拟权限错误或 JSON 编码错误，控制台出现明确警告，拍照回调继续完成，下一阵位继续发送转台信号。
+6. **功能隔离**：开关前后生成的 JPG 路径、格式和数量一致，镜头判断与隔离结果一致。
+7. **focus_calibration 回归**：其 parser、调用参数、外部 JSON 行为和 legacy 镜头逻辑均不改变。
+8. **帮助与打包**：源码运行和 PyInstaller 打包后，`--full_shot --help` 都能看到该参数，默认值一致。
+
+### 11.7 实施顺序
+
+1. 增加 `FULL_SHOT_SAVE_METADATA_DEFAULT=False` 和 `--save_metadata` 参数。
+2. 将 metadata 运行目录创建移入开关分支。
+3. 用 `args.save_metadata` 包围 step metadata 的构造、写入、路径记录以及回零后的回读更新。
+4. 保留恢复历史的独立快照，增加写盘前可序列化校验。
+5. 为 metadata 写入增加只告警、不终止拍摄的异常边界和安全写入方式。
+6. 增加 11.6 所列自动化测试，并回归 full-shot、focus_calibration 和打包入口。
